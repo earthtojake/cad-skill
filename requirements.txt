@@ -1,0 +1,4 @@
+build123d
+ezdxf
+numpy
+trimesh

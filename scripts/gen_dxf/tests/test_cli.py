@@ -12,7 +12,7 @@ class GenDxfCliTests(unittest.TestCase):
 
     def test_rejects_root_option(self) -> None:
         with self.assertRaises(SystemExit) as cm:
-            cli.main(["--root", "models/samples"])
+            cli.main(["--root", "workspace/samples"])
         self.assertEqual(2, cm.exception.code)
 
     def test_passes_targets_in_order(self) -> None:

@@ -47,12 +47,25 @@ class AssemblyInstanceSpec:
     path: str
     name: str
     transform: tuple[float, ...]
+    use_source_colors: bool = True
+
+
+@dataclass(frozen=True)
+class AssemblyNodeSpec:
+    instance_id: str
+    name: str
+    transform: tuple[float, ...]
+    use_source_colors: bool = True
+    source_path: Path | None = None
+    path: str | None = None
+    children: tuple["AssemblyNodeSpec", ...] = ()
 
 
 @dataclass(frozen=True)
 class AssemblySpec:
     assembly_path: Path
     instances: tuple[AssemblyInstanceSpec, ...]
+    children: tuple[AssemblyNodeSpec, ...] = ()
 
 
 def cad_ref_from_assembly_path(assembly_path: Path) -> str:
@@ -112,7 +125,7 @@ def assembly_spec_from_payload(assembly_path: Path, payload: object) -> Assembly
     if not isinstance(payload, dict):
         raise AssemblySpecError(f"{_display_path(resolved_path)} gen_step() must return an object")
 
-    allowed_fields = {"instances"}
+    allowed_fields = {"instances", "children"}
     extra_fields = sorted(str(key) for key in payload if key not in allowed_fields)
     if extra_fields:
         joined = ", ".join(extra_fields)
@@ -121,66 +134,77 @@ def assembly_spec_from_payload(assembly_path: Path, payload: object) -> Assembly
         )
 
     raw_instances = payload.get("instances")
-    if not isinstance(raw_instances, list) or not raw_instances:
-        raise AssemblySpecError(f"{_display_path(resolved_path)} must define a non-empty instances array")
+    raw_children = payload.get("children")
+    has_instances = "instances" in payload
+    has_children = "children" in payload
+    if has_instances == has_children:
+        raise AssemblySpecError(
+            f"{_display_path(resolved_path)} must define exactly one of non-empty instances or children"
+        )
 
-    seen_instance_ids: set[str] = set()
-    instances: list[AssemblyInstanceSpec] = []
-    for index, raw_instance in enumerate(raw_instances, start=1):
-        if not isinstance(raw_instance, dict):
-            raise AssemblySpecError(
-                f"{_display_path(resolved_path)} instances[{index}] must be an object"
-            )
-        allowed_instance_fields = {"path", "name", "transform"}
-        extra_instance_fields = sorted(str(key) for key in raw_instance if key not in allowed_instance_fields)
-        if extra_instance_fields:
-            joined = ", ".join(extra_instance_fields)
-            raise AssemblySpecError(
-                f"{_display_path(resolved_path)} instances[{index}] has unsupported field(s): {joined}"
-            )
-        name = _require_text(
-            resolved_path,
-            raw_instance.get("name"),
-            field_name=f"instances[{index}].name",
+    if has_instances:
+        if not isinstance(raw_instances, list) or not raw_instances:
+            raise AssemblySpecError(f"{_display_path(resolved_path)} must define a non-empty instances array")
+        instances = tuple(
+            _parse_instance_spec(resolved_path, raw_instance, field_name=f"instances[{index}]")
+            for index, raw_instance in enumerate(raw_instances, start=1)
         )
-        if not INSTANCE_NAME_PATTERN.fullmatch(name):
-            raise AssemblySpecError(
-                f"{_display_path(resolved_path)} instances[{index}].name must contain only "
-                "letters, numbers, '.', '_', or '-'"
-            )
-        if name in seen_instance_ids:
-            raise AssemblySpecError(
-                f"{_display_path(resolved_path)} instances[{index}].name duplicates {name!r}"
-            )
-        seen_instance_ids.add(name)
-        raw_path = _require_text(
-            resolved_path,
-            raw_instance.get("path"),
-            field_name=f"instances[{index}].path",
+        _reject_duplicate_sibling_names(resolved_path, instances, field_name="instances")
+        children = tuple(_node_from_instance(instance) for instance in instances)
+    else:
+        if not isinstance(raw_children, list) or not raw_children:
+            raise AssemblySpecError(f"{_display_path(resolved_path)} must define a non-empty children array")
+        children = tuple(
+            _parse_node_spec(resolved_path, raw_child, field_name=f"children[{index}]")
+            for index, raw_child in enumerate(raw_children, start=1)
         )
-        source_path, normalized_path = _resolve_instance_step_path(
-            resolved_path,
-            raw_path,
-            field_name=f"instances[{index}].path",
-        )
-        instances.append(
-            AssemblyInstanceSpec(
-                instance_id=name,
-                source_path=source_path,
-                path=normalized_path,
-                name=name,
-                transform=_normalize_transform(
-                    resolved_path,
-                    raw_instance.get("transform"),
-                    field_name=f"instances[{index}].transform",
-                ),
-            )
-        )
+        _reject_duplicate_sibling_names(resolved_path, children, field_name="children")
+        instances = tuple(_leaf_instances_from_nodes(children))
 
     return AssemblySpec(
         assembly_path=resolved_path,
-        instances=tuple(instances),
+        instances=instances,
+        children=children,
     )
+
+
+def assembly_spec_children(assembly_spec: AssemblySpec) -> tuple[AssemblyNodeSpec, ...]:
+    if assembly_spec.children:
+        return assembly_spec.children
+    return tuple(_node_from_instance(instance) for instance in assembly_spec.instances)
+
+
+def _node_from_instance(instance: AssemblyInstanceSpec) -> AssemblyNodeSpec:
+    return AssemblyNodeSpec(
+        instance_id=instance.instance_id,
+        name=instance.name,
+        transform=instance.transform,
+        use_source_colors=instance.use_source_colors,
+        source_path=instance.source_path,
+        path=instance.path,
+        children=(),
+    )
+
+
+def _leaf_instances_from_nodes(nodes: tuple[AssemblyNodeSpec, ...]) -> tuple[AssemblyInstanceSpec, ...]:
+    instances: list[AssemblyInstanceSpec] = []
+    for node in nodes:
+        if node.children:
+            instances.extend(_leaf_instances_from_nodes(node.children))
+            continue
+        if node.source_path is None or node.path is None:
+            raise AssemblySpecError(f"Assembly leaf node {node.instance_id!r} is missing a STEP path")
+        instances.append(
+            AssemblyInstanceSpec(
+                instance_id=node.instance_id,
+                source_path=node.source_path,
+                path=node.path,
+                name=node.name,
+                transform=node.transform,
+                use_source_colors=node.use_source_colors,
+            )
+        )
+    return tuple(instances)
 
 
 def _run_assembly_generator(assembly_path: Path) -> object:
@@ -227,11 +251,143 @@ def _run_assembly_generator(assembly_path: Path) -> object:
         envelope = gen_step()
     except Exception as exc:
         raise AssemblySpecError(f"{_display_path(assembly_path)} gen_step() failed") from exc
-    if not isinstance(envelope, dict) or "instances" not in envelope:
+    if not isinstance(envelope, dict) or ("instances" not in envelope and "children" not in envelope):
         raise AssemblySpecError(
-            f"{_display_path(assembly_path)} gen_step() must return an assembly envelope with instances"
+            f"{_display_path(assembly_path)} gen_step() must return an assembly envelope with instances or children"
         )
-    return {"instances": envelope["instances"]}
+    return {key: envelope[key] for key in ("instances", "children") if key in envelope}
+
+
+def _parse_instance_spec(assembly_path: Path, raw_instance: object, *, field_name: str) -> AssemblyInstanceSpec:
+    if not isinstance(raw_instance, dict):
+        raise AssemblySpecError(f"{_display_path(assembly_path)} {field_name} must be an object")
+    allowed_instance_fields = {"path", "name", "transform", "use_source_colors"}
+    extra_instance_fields = sorted(str(key) for key in raw_instance if key not in allowed_instance_fields)
+    if extra_instance_fields:
+        joined = ", ".join(extra_instance_fields)
+        raise AssemblySpecError(
+            f"{_display_path(assembly_path)} {field_name} has unsupported field(s): {joined}"
+        )
+    name = _normalize_instance_name(
+        assembly_path,
+        raw_instance.get("name"),
+        field_name=f"{field_name}.name",
+    )
+    raw_path = _require_text(
+        assembly_path,
+        raw_instance.get("path"),
+        field_name=f"{field_name}.path",
+    )
+    source_path, normalized_path = _resolve_instance_step_path(
+        assembly_path,
+        raw_path,
+        field_name=f"{field_name}.path",
+    )
+    return AssemblyInstanceSpec(
+        instance_id=name,
+        source_path=source_path,
+        path=normalized_path,
+        name=name,
+        transform=_normalize_transform(
+            assembly_path,
+            raw_instance.get("transform"),
+            field_name=f"{field_name}.transform",
+        ),
+        use_source_colors=_normalize_bool(
+            assembly_path,
+            raw_instance.get("use_source_colors", True),
+            field_name=f"{field_name}.use_source_colors",
+        ),
+    )
+
+
+def _parse_node_spec(assembly_path: Path, raw_node: object, *, field_name: str) -> AssemblyNodeSpec:
+    if not isinstance(raw_node, dict):
+        raise AssemblySpecError(f"{_display_path(assembly_path)} {field_name} must be an object")
+    allowed_node_fields = {"path", "name", "transform", "use_source_colors", "children"}
+    extra_node_fields = sorted(str(key) for key in raw_node if key not in allowed_node_fields)
+    if extra_node_fields:
+        joined = ", ".join(extra_node_fields)
+        raise AssemblySpecError(
+            f"{_display_path(assembly_path)} {field_name} has unsupported field(s): {joined}"
+        )
+    name = _normalize_instance_name(
+        assembly_path,
+        raw_node.get("name"),
+        field_name=f"{field_name}.name",
+    )
+    transform = _normalize_transform(
+        assembly_path,
+        raw_node.get("transform"),
+        field_name=f"{field_name}.transform",
+    )
+    use_source_colors = _normalize_bool(
+        assembly_path,
+        raw_node.get("use_source_colors", True),
+        field_name=f"{field_name}.use_source_colors",
+    )
+    source_path: Path | None = None
+    normalized_path: str | None = None
+    if "path" in raw_node:
+        raw_path = _require_text(
+            assembly_path,
+            raw_node.get("path"),
+            field_name=f"{field_name}.path",
+        )
+        source_path, normalized_path = _resolve_instance_step_path(
+            assembly_path,
+            raw_path,
+            field_name=f"{field_name}.path",
+        )
+
+    raw_children = raw_node.get("children")
+    children: tuple[AssemblyNodeSpec, ...] = ()
+    if "children" in raw_node:
+        if not isinstance(raw_children, list) or not raw_children:
+            raise AssemblySpecError(f"{_display_path(assembly_path)} {field_name}.children must be a non-empty array")
+        children = tuple(
+            _parse_node_spec(assembly_path, child, field_name=f"{field_name}.children[{index}]")
+            for index, child in enumerate(raw_children, start=1)
+        )
+        _reject_duplicate_sibling_names(assembly_path, children, field_name=f"{field_name}.children")
+    elif source_path is None:
+        raise AssemblySpecError(f"{_display_path(assembly_path)} {field_name} must define path or children")
+
+    return AssemblyNodeSpec(
+        instance_id=name,
+        name=name,
+        transform=transform,
+        use_source_colors=use_source_colors,
+        source_path=source_path,
+        path=normalized_path,
+        children=children,
+    )
+
+
+def _normalize_instance_name(assembly_path: Path, raw_value: object, *, field_name: str) -> str:
+    name = _require_text(assembly_path, raw_value, field_name=field_name)
+    if not INSTANCE_NAME_PATTERN.fullmatch(name):
+        raise AssemblySpecError(
+            f"{_display_path(assembly_path)} {field_name} must contain only "
+            "letters, numbers, '.', '_', or '-'"
+        )
+    return name
+
+
+def _reject_duplicate_sibling_names(
+    assembly_path: Path,
+    nodes: tuple[AssemblyInstanceSpec, ...] | tuple[AssemblyNodeSpec, ...],
+    *,
+    field_name: str,
+) -> None:
+    seen: set[str] = set()
+    for index, node in enumerate(nodes, start=1):
+        name = str(node.instance_id)
+        if name in seen:
+            raise AssemblySpecError(
+                f"{_display_path(assembly_path)} {field_name}[{index}].name duplicates {name!r}"
+            )
+        seen.add(name)
 
 
 def _require_text(assembly_path: Path, raw_value: object, *, field_name: str) -> str:
@@ -240,6 +396,12 @@ def _require_text(assembly_path: Path, raw_value: object, *, field_name: str) ->
             f"{_display_path(assembly_path)} {field_name} must be a non-empty string"
         )
     return raw_value.strip()
+
+
+def _normalize_bool(assembly_path: Path, raw_value: object, *, field_name: str) -> bool:
+    if isinstance(raw_value, bool):
+        return raw_value
+    raise AssemblySpecError(f"{_display_path(assembly_path)} {field_name} must be true or false")
 
 
 def _normalize_transform(

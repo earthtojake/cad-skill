@@ -9,8 +9,8 @@ from common.catalog import (
     cad_ref_from_step_path as fallback_cad_ref_from_step_path,
     find_source_by_cad_ref,
     find_source_by_path,
-    viewer_artifact_path_for_step_path,
-    viewer_directory_for_step_path,
+    explorer_artifact_path_for_step_path,
+    explorer_directory_for_step_path,
 )
 
 
@@ -39,50 +39,61 @@ def part_stl_path_for_cad_ref(cad_ref: str) -> Path:
     return source.stl_path
 
 
-def viewer_dir_for_cad_ref(cad_ref: str) -> Path:
+def part_3mf_path_for_cad_ref(cad_ref: str) -> Path:
+    source = _source_for_cad_ref(cad_ref)
+    if source.three_mf_path is None:
+        raise ValueError(f"CAD STEP ref has no configured 3MF output: {cad_ref}")
+    return source.three_mf_path
+
+
+def explorer_dir_for_cad_ref(cad_ref: str) -> Path:
     source = _source_for_cad_ref(cad_ref)
     if source.step_path is None:
         raise ValueError(f"CAD STEP ref has no STEP path: {cad_ref}")
-    return viewer_directory_for_step_path(source.step_path)
+    return explorer_directory_for_step_path(source.step_path)
 
 
-def viewer_artifact_path(cad_ref: str, suffix: str) -> Path:
+def explorer_artifact_path(cad_ref: str, suffix: str) -> Path:
     source = _source_for_cad_ref(cad_ref)
     if source.step_path is None:
         raise ValueError(f"CAD STEP ref has no STEP path: {cad_ref}")
-    return viewer_artifact_path_for_step_path(source.step_path, suffix)
+    return explorer_artifact_path_for_step_path(source.step_path, suffix)
 
 
 def part_glb_path_for_cad_ref(cad_ref: str) -> Path:
-    return viewer_artifact_path(cad_ref, ".glb")
+    return explorer_artifact_path(cad_ref, ".glb")
 
 
 def part_selector_manifest_path_for_cad_ref(cad_ref: str) -> Path:
-    return viewer_artifact_path(cad_ref, ".topology.json")
+    return explorer_artifact_path(cad_ref, ".topology.json")
 
 
 def part_selector_binary_path_for_cad_ref(cad_ref: str) -> Path:
-    return viewer_artifact_path(cad_ref, ".topology.bin")
+    return explorer_artifact_path(cad_ref, ".topology.bin")
 
 
 def native_component_glb_dir(step_path: Path) -> Path:
-    return viewer_directory_for_step_path(step_path) / "components"
+    return explorer_directory_for_step_path(step_path) / "components"
 
 
 def part_stl_path(step_path: Path) -> Path:
     return part_stl_path_for_cad_ref(cad_ref_from_step_path(step_path))
 
 
+def part_3mf_path(step_path: Path) -> Path:
+    return part_3mf_path_for_cad_ref(cad_ref_from_step_path(step_path))
+
+
 def part_glb_path(step_path: Path) -> Path:
-    return viewer_artifact_path_for_step_path(step_path, ".glb")
+    return explorer_artifact_path_for_step_path(step_path, ".glb")
 
 
 def part_selector_manifest_path(step_path: Path) -> Path:
-    return viewer_artifact_path_for_step_path(step_path, ".topology.json")
+    return explorer_artifact_path_for_step_path(step_path, ".topology.json")
 
 
 def part_selector_binary_path(step_path: Path) -> Path:
-    return viewer_artifact_path_for_step_path(step_path, ".topology.bin")
+    return explorer_artifact_path_for_step_path(step_path, ".topology.bin")
 
 
 def render_artifact_paths_for_cad_ref(cad_ref: str) -> tuple[Path, Path, Path, Path]:

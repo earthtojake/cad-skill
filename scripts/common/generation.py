@@ -4,7 +4,7 @@ import argparse
 import importlib.util
 import json
 import sys
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Sequence
@@ -32,12 +32,15 @@ from common.catalog import (
 from common.dxf import build_dxf_render_payload
 from common.glb import export_part_glb_from_step, export_shape_glb, write_empty_glb
 from common.metadata import (
+    DEFAULT_3MF_ANGULAR_TOLERANCE,
+    DEFAULT_3MF_TOLERANCE,
     DEFAULT_GLB_ANGULAR_TOLERANCE,
     DEFAULT_GLB_TOLERANCE,
     DEFAULT_STL_ANGULAR_TOLERANCE,
     DEFAULT_STL_TOLERANCE,
     GeneratorMetadata,
     normalize_mesh_numeric,
+    resolve_3mf_settings,
     resolve_glb_settings,
     resolve_stl_settings,
 )
@@ -49,8 +52,10 @@ from common.render import (
     relative_to_repo,
 )
 from common.stl import export_part_stl_from_scene
+from common.threemf import export_part_3mf_from_scene
 from common.validators import geometry_summary_from_manifest
 from common.step_scene import (
+    ColorRGBA,
     LoadedStepScene,
     SelectorOptions,
     SelectorProfile,
@@ -80,9 +85,13 @@ class EntrySpec:
     dxf_path: Path | None = None
     urdf_path: Path | None = None
     stl_path: Path | None = None
+    three_mf_path: Path | None = None
     export_stl: bool = False
+    export_3mf: bool = False
     stl_tolerance: float = DEFAULT_STL_TOLERANCE
     stl_angular_tolerance: float = DEFAULT_STL_ANGULAR_TOLERANCE
+    three_mf_tolerance: float = DEFAULT_3MF_TOLERANCE
+    three_mf_angular_tolerance: float = DEFAULT_3MF_ANGULAR_TOLERANCE
     glb_tolerance: float = DEFAULT_GLB_TOLERANCE
     glb_angular_tolerance: float = DEFAULT_GLB_ANGULAR_TOLERANCE
     color: tuple[float, float, float, float] | None = None
@@ -173,6 +182,12 @@ def _entry_spec_from_source(source: CadSource) -> EntrySpec:
         stl_tolerance=source.stl_tolerance,
         stl_angular_tolerance=source.stl_angular_tolerance,
     )
+    three_mf_settings = resolve_3mf_settings(
+        cad_ref=source.cad_ref,
+        generator_metadata=generator_metadata,
+        three_mf_tolerance=source.three_mf_tolerance,
+        three_mf_angular_tolerance=source.three_mf_angular_tolerance,
+    )
     glb_settings = resolve_glb_settings(
         cad_ref=source.cad_ref,
         generator_metadata=generator_metadata,
@@ -199,9 +214,13 @@ def _entry_spec_from_source(source: CadSource) -> EntrySpec:
         dxf_path=source.dxf_path,
         urdf_path=urdf_path,
         stl_path=source.stl_path,
+        three_mf_path=source.three_mf_path,
         export_stl=source.export_stl,
+        export_3mf=source.export_3mf,
         stl_tolerance=stl_settings.tolerance,
         stl_angular_tolerance=stl_settings.angular_tolerance,
+        three_mf_tolerance=three_mf_settings.tolerance,
+        three_mf_angular_tolerance=three_mf_settings.angular_tolerance,
         glb_tolerance=glb_settings.tolerance,
         glb_angular_tolerance=glb_settings.angular_tolerance,
         color=source.color,
@@ -222,19 +241,32 @@ def _read_optional_urdf_source(urdf_path: Path) -> object | None:
 
 def _validate_part_render_output_paths(specs: Sequence[EntrySpec]) -> None:
     sources_by_stl_path: dict[Path, str] = {}
+    sources_by_3mf_path: dict[Path, str] = {}
     for spec in specs:
-        if spec.kind not in {"part", "assembly"} or spec.step_path is None or not spec.export_stl:
+        if spec.kind not in {"part", "assembly"} or spec.step_path is None:
             continue
-        if spec.stl_path is None:
-            raise ValueError(f"{spec.source_ref} export_stl is enabled but stl_path is missing")
-        stl_path = spec.stl_path.resolve()
-        existing_source_ref = sources_by_stl_path.get(stl_path)
-        if existing_source_ref is not None and existing_source_ref != spec.source_ref:
-            raise ValueError(
-                "STL output collision between "
-                f"{existing_source_ref} and {spec.source_ref}: {stl_path.relative_to(REPO_ROOT)}"
-            )
-        sources_by_stl_path[stl_path] = spec.source_ref
+        if spec.export_stl:
+            if spec.stl_path is None:
+                raise ValueError(f"{spec.source_ref} export_stl is enabled but stl_path is missing")
+            stl_path = spec.stl_path.resolve()
+            existing_source_ref = sources_by_stl_path.get(stl_path)
+            if existing_source_ref is not None and existing_source_ref != spec.source_ref:
+                raise ValueError(
+                    "STL output collision between "
+                    f"{existing_source_ref} and {spec.source_ref}: {stl_path.relative_to(REPO_ROOT)}"
+                )
+            sources_by_stl_path[stl_path] = spec.source_ref
+        if spec.export_3mf:
+            if spec.three_mf_path is None:
+                raise ValueError(f"{spec.source_ref} export_3mf is enabled but three_mf_path is missing")
+            three_mf_path = spec.three_mf_path.resolve()
+            existing_source_ref = sources_by_3mf_path.get(three_mf_path)
+            if existing_source_ref is not None and existing_source_ref != spec.source_ref:
+                raise ValueError(
+                    "3MF output collision between "
+                    f"{existing_source_ref} and {spec.source_ref}: {three_mf_path.relative_to(REPO_ROOT)}"
+                )
+            sources_by_3mf_path[three_mf_path] = spec.source_ref
 
 
 def selected_entry_specs(all_specs: Sequence[EntrySpec], source_refs: Sequence[str]) -> list[EntrySpec]:
@@ -376,12 +408,12 @@ def _write_part_step_payload(envelope: dict[str, object], *, output_path: Path, 
 def _write_assembly_step_payload(envelope: dict[str, object], *, output_path: Path, script_path: Path) -> None:
     from .assembly_export import export_assembly_step_from_payload
 
-    if "instances" not in envelope:
+    if "instances" not in envelope and "children" not in envelope:
         raise TypeError(
-            f"{_display_path(script_path)} gen_step() envelope must define 'instances'"
+            f"{_display_path(script_path)} gen_step() envelope must define 'instances' or 'children'"
         )
     export_assembly_step_from_payload(
-        {"instances": envelope["instances"]},
+        {key: envelope[key] for key in ("instances", "children") if key in envelope},
         assembly_path=script_path,
         output_path=output_path,
     )
@@ -411,6 +443,23 @@ def _write_urdf_payload(envelope: dict[str, object], *, output_path: Path, scrip
     text = xml if xml.endswith("\n") else xml + "\n"
     output_path.write_text(text, encoding="utf-8")
     print(f"Wrote URDF: {output_path}")
+    _write_urdf_explorer_metadata_payload(envelope, output_path=output_path, script_path=script_path)
+
+
+def _write_urdf_explorer_metadata_payload(envelope: dict[str, object], *, output_path: Path, script_path: Path) -> None:
+    if "explorer_metadata" not in envelope or envelope.get("explorer_metadata") is None:
+        return
+    explorer_metadata = envelope.get("explorer_metadata")
+    if not isinstance(explorer_metadata, dict):
+        raise TypeError(
+            f"{_display_path(script_path)} gen_urdf() envelope field 'explorer_metadata' must be an object, "
+            f"got {type(explorer_metadata).__name__}"
+        )
+    explorer_dir = output_path.parent / f".{output_path.name}"
+    explorer_dir.mkdir(parents=True, exist_ok=True)
+    explorer_metadata_path = explorer_dir / "explorer.json"
+    explorer_metadata_path.write_text(json.dumps(explorer_metadata, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    print(f"Wrote URDF explorer metadata: {explorer_metadata_path}")
 
 
 def run_script_generator(spec: EntrySpec, generator_name: str) -> None:
@@ -560,6 +609,106 @@ def _assembly_composition_for_spec(
     )
 
 
+def _script_step_material_colors(spec: EntrySpec) -> dict[str, ColorRGBA]:
+    if spec.script_path is None:
+        return {}
+    try:
+        module = _load_generator_module(spec.script_path)
+    except Exception:
+        return {}
+    raw_materials = getattr(module, "URDF_MATERIALS", {})
+    raw_step_materials = getattr(module, "URDF_STEP_MATERIALS", {})
+    if not isinstance(raw_materials, Mapping) or not isinstance(raw_step_materials, Mapping):
+        return {}
+    colors: dict[str, ColorRGBA] = {}
+    for raw_step_path, raw_material_name in raw_step_materials.items():
+        if not isinstance(raw_step_path, str) or not isinstance(raw_material_name, str):
+            continue
+        raw_color = raw_materials.get(raw_material_name)
+        try:
+            color = normalize_step_color(raw_color, base_path=spec.source_path, field_name=f"URDF_MATERIALS.{raw_material_name}")
+        except Exception:
+            color = None
+        if color is not None:
+            colors[Path(raw_step_path).as_posix()] = color
+    return colors
+
+
+def _color_key(color: ColorRGBA) -> tuple[int, int, int, int]:
+    return tuple(max(0, min(255, int(round(float(channel) * 255)))) for channel in color)
+
+
+def _uniform_source_step_color(step_path: Path) -> ColorRGBA | None:
+    try:
+        scene = load_step_scene(step_path)
+    except Exception:
+        return None
+    colors: list[ColorRGBA] = []
+    colors.extend(tuple(float(value) for value in color) for color in scene.prototype_colors.values())
+    for face_colors in scene.prototype_face_colors.values():
+        colors.extend(tuple(float(value) for value in color) for color in face_colors.values())
+    colors.extend(
+        tuple(float(value) for value in node.color)
+        for node in scene_leaf_occurrences(scene)
+        if node.color is not None
+    )
+    by_key = {_color_key(color): color for color in colors}
+    if len(by_key) == 1:
+        return next(iter(by_key.values()))
+    return None
+
+
+def _assembly_3mf_occurrence_colors(
+    spec: EntrySpec,
+    assembly_composition: dict[str, object] | None,
+) -> dict[str, ColorRGBA]:
+    if spec.step_path is None or not assembly_composition:
+        return {}
+    root = assembly_composition.get("root")
+    if not isinstance(root, Mapping):
+        return {}
+    topology_dir = part_selector_manifest_path(spec.step_path).parent
+    step_root = spec.step_path.parent.resolve()
+    script_step_colors = _script_step_material_colors(spec)
+    source_color_cache: dict[Path, ColorRGBA | None] = {}
+    occurrence_colors: dict[str, ColorRGBA] = {}
+
+    def color_for_source(raw_source_path: object, *, use_source_colors: bool) -> ColorRGBA | None:
+        if not use_source_colors:
+            return None
+        if not isinstance(raw_source_path, str) or not raw_source_path.strip():
+            return None
+        source_path = (topology_dir / raw_source_path).resolve()
+        try:
+            step_key = source_path.relative_to(step_root).as_posix()
+        except ValueError:
+            step_key = source_path.as_posix()
+        material_color = script_step_colors.get(step_key)
+        if material_color is not None:
+            return material_color
+        if source_path not in source_color_cache:
+            source_color_cache[source_path] = _uniform_source_step_color(source_path)
+        return source_color_cache[source_path]
+
+    def collect(node: Mapping[str, object]) -> None:
+        children = node.get("children")
+        if isinstance(children, list) and children:
+            for child in children:
+                if isinstance(child, Mapping):
+                    collect(child)
+            return
+        occurrence_id = str(node.get("occurrenceId") or node.get("id") or "").strip()
+        color = color_for_source(
+            node.get("sourcePath"),
+            use_source_colors=node.get("useSourceColors") is not False,
+        )
+        if occurrence_id and color is not None:
+            occurrence_colors[occurrence_id] = color
+
+    collect(root)
+    return occurrence_colors
+
+
 def _generate_part_outputs(spec: EntrySpec, *, entries_by_step_path: dict[Path, EntrySpec]) -> LoadedStepScene | None:
     if spec.kind not in {"part", "assembly"} or spec.step_path is None:
         return None
@@ -567,6 +716,8 @@ def _generate_part_outputs(spec: EntrySpec, *, entries_by_step_path: dict[Path, 
     manifest_path = part_selector_manifest_path(spec.step_path)
     scene = load_step_scene(spec.step_path)
     selector_options = _selector_options_for_part(spec)
+    three_mf_options: SelectorOptions | None = None
+    defer_3mf_export = spec.export_3mf and spec.kind == "assembly" and spec.source == "generated"
     if spec.export_stl:
         stl_options = SelectorOptions(
             linear_deflection=spec.stl_tolerance,
@@ -582,6 +733,22 @@ def _generate_part_outputs(spec: EntrySpec, *, entries_by_step_path: dict[Path, 
         if spec.stl_path is None:
             raise RuntimeError(f"{spec.source_ref} export_stl is enabled but stl_path is missing")
         export_part_stl_from_scene(spec.step_path, scene, target_path=spec.stl_path)
+    if spec.export_3mf:
+        three_mf_options = SelectorOptions(
+            linear_deflection=spec.three_mf_tolerance,
+            angular_deflection=spec.three_mf_angular_tolerance,
+            relative=selector_options.relative,
+        )
+        mesh_step_scene(
+            scene,
+            linear_deflection=three_mf_options.linear_deflection,
+            angular_deflection=three_mf_options.angular_deflection,
+            relative=three_mf_options.relative,
+        )
+        if spec.three_mf_path is None:
+            raise RuntimeError(f"{spec.source_ref} export_3mf is enabled but three_mf_path is missing")
+        if not defer_3mf_export:
+            export_part_3mf_from_scene(spec.step_path, scene, target_path=spec.three_mf_path, color=spec.color)
     mesh_step_scene(
         scene,
         linear_deflection=selector_options.linear_deflection,
@@ -603,6 +770,8 @@ def _generate_part_outputs(spec: EntrySpec, *, entries_by_step_path: dict[Path, 
             color=spec.color,
         )
     if spec.skip_topology:
+        if defer_3mf_export:
+            export_part_3mf_from_scene(spec.step_path, scene, target_path=spec.three_mf_path, color=spec.color)
         return scene
     previous_manifest = _read_json_payload(manifest_path) if manifest_path.exists() else None
     bundle = extract_selectors_from_scene(
@@ -611,6 +780,7 @@ def _generate_part_outputs(spec: EntrySpec, *, entries_by_step_path: dict[Path, 
         profile=SelectorProfile.ARTIFACT,
         options=selector_options,
     )
+    assembly_composition: dict[str, object] | None = None
     if spec.kind == "assembly":
         try:
             assembly_composition = _assembly_composition_for_spec(
@@ -625,6 +795,22 @@ def _generate_part_outputs(spec: EntrySpec, *, entries_by_step_path: dict[Path, 
             raise RuntimeError(f"Failed to build assembly composition for {spec.source_ref}") from exc
         if assembly_composition is not None:
             bundle.manifest["assembly"] = assembly_composition
+    if defer_3mf_export:
+        if three_mf_options is None:
+            raise RuntimeError(f"{spec.source_ref} export_3mf is enabled but 3MF settings are missing")
+        mesh_step_scene(
+            scene,
+            linear_deflection=three_mf_options.linear_deflection,
+            angular_deflection=three_mf_options.angular_deflection,
+            relative=three_mf_options.relative,
+        )
+        export_part_3mf_from_scene(
+            spec.step_path,
+            scene,
+            target_path=spec.three_mf_path,
+            color=spec.color,
+            occurrence_colors=_assembly_3mf_occurrence_colors(spec, assembly_composition),
+        )
     write_selector_artifacts(bundle, manifest_path)
     _report_selector_manifest_change(spec, previous_manifest, bundle.manifest)
     return scene
@@ -766,7 +952,7 @@ def _expand_specs_with_file_dependencies(specs: Sequence[EntrySpec]) -> list[Ent
         for instance in assembly_spec.instances:
             if instance.source_path.resolve() in seen_step_paths:
                 continue
-            source = source_from_path(instance.source_path)
+            source = find_source_by_path(instance.source_path) or source_from_path(instance.source_path)
             if source is None:
                 continue
             child_spec = _entry_spec_from_source(source)
@@ -960,6 +1146,29 @@ def _add_step_import_arguments(parser: argparse.ArgumentParser) -> None:
         help="Positive STL angular deflection for direct STEP/STP targets.",
     )
     parser.add_argument(
+        "--export-3mf",
+        action="store_true",
+        dest="export_3mf",
+        help="Export a 3MF sidecar for direct STEP/STP targets.",
+    )
+    parser.add_argument(
+        "--3mf-output",
+        dest="three_mf_output",
+        help="Relative .3mf output path for direct STEP/STP targets when --export-3mf is set.",
+    )
+    parser.add_argument(
+        "--3mf-tolerance",
+        type=float,
+        dest="three_mf_tolerance",
+        help="Positive 3MF linear deflection for direct STEP/STP targets.",
+    )
+    parser.add_argument(
+        "--3mf-angular-tolerance",
+        type=float,
+        dest="three_mf_angular_tolerance",
+        help="Positive 3MF angular deflection for direct STEP/STP targets.",
+    )
+    parser.add_argument(
         "--glb-tolerance",
         type=float,
         help="Positive GLB linear deflection for direct STEP/STP targets.",
@@ -997,6 +1206,18 @@ def _step_import_options_from_args(
         stl_angular_tolerance=_normalize_cli_numeric(
             args.stl_angular_tolerance,
             field_name="stl_angular_tolerance",
+            parser=parser,
+        ),
+        export_3mf=bool(args.export_3mf),
+        three_mf_output=args.three_mf_output,
+        three_mf_tolerance=_normalize_cli_numeric(
+            args.three_mf_tolerance,
+            field_name="3mf_tolerance",
+            parser=parser,
+        ),
+        three_mf_angular_tolerance=_normalize_cli_numeric(
+            args.three_mf_angular_tolerance,
+            field_name="3mf_angular_tolerance",
             parser=parser,
         ),
         glb_tolerance=_normalize_cli_numeric(

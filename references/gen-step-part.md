@@ -1,11 +1,12 @@
 # gen_step_part
 
-Regenerates explicit part STEP targets and their package-local viewer artifacts.
+Regenerates explicit part STEP targets and their package-local explorer artifacts.
 
 ```bash
-python <cad-skill>/scripts/gen_step_part path/to/part.py
-python <cad-skill>/scripts/gen_step_part path/to/imported.step --summary
-python <cad-skill>/scripts/gen_step_part path/to/imported.step --export-stl --stl-output ../meshes/imported.stl
+python <cad-skill>/scripts/gen_step_part/cli.py path/to/part.py
+python <cad-skill>/scripts/gen_step_part/cli.py path/to/imported.step --summary
+python <cad-skill>/scripts/gen_step_part/cli.py path/to/imported.step --export-stl --stl-output ../meshes/imported.stl
+python <cad-skill>/scripts/gen_step_part/cli.py path/to/imported.step --export-3mf --3mf-output ../meshes/imported.3mf
 ```
 
 Targets must be explicit file paths:
@@ -21,6 +22,8 @@ Direct STEP/STP targets may use:
 
 - `--export-stl`
 - `--stl-output`
+- `--export-3mf`
+- `--3mf-output`
 - mesh tolerance flags
 - `--color`
 - `--skip-topology`

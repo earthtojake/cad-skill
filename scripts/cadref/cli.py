@@ -5,13 +5,30 @@ import json
 import sys
 from pathlib import Path
 
-from .inspect import (
-    CadRefError,
-    cad_path_from_target,
-    diff_entry_targets,
-    inspect_cad_refs,
-    inspect_entry_planes,
-)
+if __package__ in {None, ""}:
+    package_dir = Path(__file__).resolve().parent
+    scripts_dir = package_dir.parent
+    sys.path = [
+        entry
+        for entry in sys.path
+        if not entry or Path(entry).resolve() != package_dir
+    ]
+    sys.path.insert(0, str(scripts_dir))
+    from cadref.inspect import (
+        CadRefError,
+        cad_path_from_target,
+        diff_entry_targets,
+        inspect_cad_refs,
+        inspect_entry_planes,
+    )
+else:
+    from .inspect import (
+        CadRefError,
+        cad_path_from_target,
+        diff_entry_targets,
+        inspect_cad_refs,
+        inspect_entry_planes,
+    )
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -308,3 +325,7 @@ def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
     return int(args.handler(args))
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

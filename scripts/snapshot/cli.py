@@ -12,6 +12,15 @@ REPO_ROOT = Path.cwd().resolve()
 CAD_ROOT = REPO_ROOT
 DEFAULT_MODEL_COLOR = (0.80, 0.84, 0.90)
 DEFAULT_BACKGROUND_COLOR = (0.98, 0.985, 0.99)
+BUILD123D_GLB_ROOT_CORRECTION = np.asarray(
+    [
+        [1.0, 0.0, 0.0, 0.0],
+        [0.0, 0.0, 1.0, 0.0],
+        [0.0, -1.0, 0.0, 0.0],
+        [0.0, 0.0, 0.0, 1.0],
+    ],
+    dtype=np.float64,
+)
 FALLBACK_COMPONENT_COLORS: tuple[tuple[float, float, float], ...] = (
     (0.82, 0.84, 0.88),
     (0.68, 0.77, 0.91),
@@ -84,26 +93,14 @@ def resolve_view(view: str | CameraView) -> CameraView:
     return VIEW_PRESETS[view] if isinstance(view, str) else view
 
 
-def _parse_hex_color(raw_value: str | None) -> tuple[float, float, float] | None:
-    normalized = str(raw_value or "").strip()
-    if not normalized:
-        return None
-    if len(normalized) == 4 and normalized.startswith("#"):
-        normalized = "#" + "".join(channel * 2 for channel in normalized[1:])
-    if len(normalized) != 7 or not normalized.startswith("#"):
-        return None
-    try:
-        return tuple(int(normalized[index:index + 2], 16) / 255 for index in (1, 3, 5))  # type: ignore[return-value]
-    except ValueError:
-        return None
-
-
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Render CAD snapshot PNGs from GLB/STL files or Python assembly entries.")
+    parser = argparse.ArgumentParser(
+        description="Render CAD snapshot PNGs from GLB or STL mesh files. Prefer generated assembly GLBs."
+    )
     parser.add_argument(
         "input",
         type=Path,
-        help="Path to a part GLB/STL, or a Python assembly generator.",
+        help="Path to a part GLB, generated assembly GLB, or STL mesh.",
     )
     parser.add_argument("--out", type=Path, help="Write one PNG snapshot to this path.")
     parser.add_argument(
@@ -178,7 +175,6 @@ def main(argv: list[str] | None = None) -> int:
         label = f"{view_name} " if len(render_jobs) > 1 else ""
         print(f"saved {label}png: {png_out.resolve()}")
     return 0
-
 
 def _resolve_render_jobs(args: argparse.Namespace, parser: argparse.ArgumentParser) -> list[tuple[str, Path]]:
     views = str(args.views or "").strip()
@@ -275,7 +271,10 @@ def load_mesh_instances(input_path: Path) -> list[MeshInstance]:
     resolved_input = _resolve_cad_path(input_path, kind="input")
     lowered = resolved_input.name.lower()
     if lowered.endswith(".py"):
-        return _load_assembly_instances(resolved_input)
+        raise ValueError(
+            "Python assembly inputs are no longer supported by snapshot; "
+            "render the generated assembly GLB instead."
+        )
     if lowered.endswith(".glb"):
         return [_read_glb_mesh(resolved_input)]
     if lowered.endswith(".stl"):
@@ -325,38 +324,9 @@ def _resolve_cad_path(path: Path, *, kind: str) -> Path:
     if not resolved.exists():
         raise FileNotFoundError(f"snapshot {kind} not found: {path}")
     lowered = resolved.name.lower()
-    if lowered.endswith((".py", ".glb", ".stl")):
+    if lowered.endswith((".glb", ".stl")):
         return resolved
     return resolved
-
-
-def _load_assembly_instances(
-    assembly_path: Path,
-) -> list[MeshInstance]:
-    from common.assembly_flatten import flatten_source_path
-
-    try:
-        resolved_parts = flatten_source_path(assembly_path)
-    except Exception as exc:
-        raise ValueError(str(exc)) from exc
-
-    mesh_cache: dict[Path, MeshInstance] = {}
-    output: list[MeshInstance] = []
-    for part in resolved_parts:
-        mesh = _read_glb_mesh(
-            _resolve_cad_path(part.glb_path, kind="part GLB"),
-            transform=part.transform,
-            mesh_cache=mesh_cache,
-        )
-        explicit_color = _parse_hex_color(part.color)
-        output.append(
-            MeshInstance(
-                vertices=mesh.vertices,
-                triangles=mesh.triangles,
-                color_rgb=explicit_color if explicit_color is not None else mesh.color_rgb,
-            )
-        )
-    return output
 
 
 def _read_glb_mesh(
@@ -372,14 +342,19 @@ def _read_glb_mesh(
     if base_mesh is None:
         loaded = trimesh.load(resolved_path, force="scene")
         if isinstance(loaded, trimesh.Scene):
+            cad_correction = _build123d_glb_cad_correction(loaded)
             mesh = loaded.to_geometry()
         elif isinstance(loaded, trimesh.Trimesh):
+            cad_correction = None
             mesh = loaded
         else:
             raise RuntimeError(f"No GLB geometry loaded from {resolved_path}")
         if mesh.vertices.size <= 0 or mesh.faces.size <= 0:
             raise RuntimeError(f"No GLB geometry loaded from {resolved_path}")
-        vertices = np.asarray(mesh.vertices, dtype=np.float64) * 1000.0
+        vertices = np.asarray(mesh.vertices, dtype=np.float64)
+        if cad_correction is not None:
+            vertices = _apply_transform(vertices, cad_correction)
+        vertices = vertices * 1000.0
         triangles = np.asarray(mesh.faces, dtype=np.int64)
         base_mesh = MeshInstance(vertices=vertices, triangles=triangles)
         if mesh_cache is not None:
@@ -392,6 +367,27 @@ def _read_glb_mesh(
         triangles=base_mesh.triangles,
         color_rgb=base_mesh.color_rgb,
     )
+
+
+def _build123d_glb_cad_correction(scene: object) -> np.ndarray | None:
+    graph = getattr(scene, "graph", None)
+    base_frame = getattr(graph, "base_frame", None)
+    transforms = getattr(graph, "transforms", None)
+    children_by_parent = getattr(transforms, "children", None)
+    if graph is None or base_frame is None or not isinstance(children_by_parent, dict):
+        return None
+    root_children = list(children_by_parent.get(base_frame, ()))
+    if len(root_children) != 1:
+        return None
+    try:
+        root_matrix = np.asarray(graph[root_children[0]][0], dtype=np.float64)
+    except Exception:
+        return None
+    if root_matrix.shape != (4, 4):
+        return None
+    if not np.allclose(root_matrix, BUILD123D_GLB_ROOT_CORRECTION, atol=1e-6, rtol=0.0):
+        return None
+    return np.linalg.inv(root_matrix)
 
 
 def _read_stl_mesh(
@@ -484,9 +480,12 @@ def _triangle_indices(polydata: object) -> np.ndarray:
 
 
 def _apply_transform(vertices: np.ndarray, transform: object) -> np.ndarray:
-    if not isinstance(transform, (list, tuple)) or len(transform) != 16:
+    if isinstance(transform, np.ndarray) and transform.shape == (4, 4):
+        matrix = transform.astype(np.float64, copy=False)
+    elif isinstance(transform, (list, tuple)) and len(transform) == 16:
+        matrix = np.asarray([float(value) for value in transform], dtype=np.float64).reshape(4, 4)
+    else:
         raise ValueError("manifest transform must be a 16-number array")
-    matrix = np.asarray([float(value) for value in transform], dtype=np.float64).reshape(4, 4)
     homogeneous = np.concatenate([vertices, np.ones((vertices.shape[0], 1), dtype=np.float64)], axis=1)
     transformed = homogeneous @ matrix.T
     w = transformed[:, 3:4]
@@ -946,3 +945,7 @@ def _write_png(image: np.ndarray, png_path: Path) -> None:
     png_bytes.extend(chunk(b"IDAT", zlib.compress(bytes(scanlines), level=9)))
     png_bytes.extend(chunk(b"IEND", b""))
     png_path.write_bytes(png_bytes)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

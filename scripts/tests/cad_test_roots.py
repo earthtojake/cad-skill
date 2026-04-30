@@ -9,8 +9,7 @@ from unittest import mock
 from common import assembly_spec, catalog, generation, render
 
 
-REPO_ROOT = Path(__file__).resolve().parents[2]
-IGNORED_TEST_ROOT = REPO_ROOT / "tmp" / "cad-tests"
+IGNORED_TEST_ROOT = Path(__file__).resolve().parents[5] / "tmp" / "cad-skill-tests"
 
 
 class IsolatedCadRoots:
@@ -20,7 +19,7 @@ class IsolatedCadRoots:
         testcase.addCleanup(self._tempdir.cleanup)
 
         self.root = Path(self._tempdir.name)
-        self.cad_root = self.root / "models"
+        self.cad_root = self.root / "workspace"
         self.cad_root.mkdir(parents=True, exist_ok=True)
 
         patches = [

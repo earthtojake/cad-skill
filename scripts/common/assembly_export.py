@@ -1,14 +1,18 @@
 from __future__ import annotations
 
 from pathlib import Path
+from typing import Sequence
 
-from common.assembly_flatten import CatalogEntry, flatten_entry, filesystem_entry
+from common.assembly_flatten import CatalogEntry, filesystem_entry
 from common.assembly_spec import (
     REPO_ROOT,
     AssemblySpec,
+    AssemblyNodeSpec,
     assembly_spec_from_payload,
+    assembly_spec_children,
 )
 from common.catalog import find_source_by_cad_ref
+from common.render import part_selector_manifest_path
 
 
 GIT_LFS_POINTER_PREFIX = b"version https://git-lfs.github.com/spec/v1\n"
@@ -70,6 +74,47 @@ def _load_step_shape(step_path: Path):
         raise RuntimeError(f"Failed to load referenced STEP file: {_relative_to_repo(step_path)}") from exc
 
 
+def _step_has_assembly_artifact(step_path: Path) -> bool:
+    import json
+
+    topology_path = part_selector_manifest_path(step_path)
+    try:
+        payload = json.loads(topology_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return False
+    root = payload.get("assembly", {}).get("root") if isinstance(payload.get("assembly"), dict) else None
+    return isinstance(root, dict) and bool(root.get("children"))
+
+
+def _load_step_assembly_shape(step_path: Path, *, label: str):
+    import build123d
+
+    from common.step_scene import load_step_scene, occurrence_selector_id, scene_occurrence_shape
+
+    scene = load_step_scene(step_path)
+
+    def node_label(node: object) -> str:
+        return str(getattr(node, "name", None) or getattr(node, "source_name", None) or occurrence_selector_id(node)).strip()
+
+    def build_node(node: object):
+        children = list(getattr(node, "children", []) or [])
+        if children:
+            child_shapes = [build_node(child) for child in children]
+            return build123d.Compound(
+                obj=child_shapes,
+                children=child_shapes,
+                label=node_label(node),
+            )
+        shape = build123d.Shape(obj=scene_occurrence_shape(scene, node))
+        shape.label = node_label(node)
+        return shape
+
+    roots = [build_node(root) for root in scene.roots]
+    if not roots:
+        return _load_step_shape(step_path)
+    return build123d.Compound(obj=roots, children=roots, label=label)
+
+
 def _source_color_for_cad_ref(cad_ref: str):
     try:
         source = find_source_by_cad_ref(cad_ref)
@@ -78,40 +123,135 @@ def _source_color_for_cad_ref(cad_ref: str):
     return source.color if source is not None else None
 
 
-def build_assembly_compound(assembly_spec: AssemblySpec, *, label: str | None = None):
+def _clear_shape_colors(shape: object) -> None:
+    if hasattr(shape, "color"):
+        shape.color = None
+    for child in getattr(shape, "children", []) or []:
+        _clear_shape_colors(child)
+
+
+def _apply_source_color(shape: object, cad_ref: str, *, use_source_colors: bool) -> None:
     import build123d
 
-    root_source = filesystem_entry(assembly_spec.assembly_path)
-    root_cad_ref = root_source.cad_ref if root_source is not None else assembly_spec.assembly_path.stem
-    root_source_ref = root_source.source_ref if root_source is not None else _relative_to_repo(assembly_spec.assembly_path)
-    root_entry = CatalogEntry(
-        cad_ref=root_cad_ref,
-        source_ref=root_source_ref,
-        kind="assembly",
-        source_path=assembly_spec.assembly_path,
-        assembly_spec=assembly_spec,
+    source_color = _source_color_for_cad_ref(cad_ref)
+    if not use_source_colors:
+        _clear_shape_colors(shape)
+    elif source_color is not None:
+        shape.color = build123d.Color(*source_color)
+
+
+def _shape_for_part_entry(entry: CatalogEntry, *, label: str, use_source_colors: bool):
+    step_path = entry.step_path.resolve() if entry.step_path is not None else None
+    if step_path is None:
+        raise RuntimeError(f"Part source {entry.source_ref} is missing STEP source path")
+    shape = (
+        _load_step_assembly_shape(step_path, label=label)
+        if _step_has_assembly_artifact(step_path)
+        else _load_step_shape(step_path)
     )
-    resolved_parts = flatten_entry(root_entry, resolve_entry=filesystem_entry)
-    if not resolved_parts:
-        raise RuntimeError(f"{_relative_to_repo(assembly_spec.assembly_path)} has no resolved STEP instances")
+    _apply_source_color(shape, entry.cad_ref, use_source_colors=use_source_colors)
+    shape.label = label
+    return shape
 
-    children: list[build123d.Shape] = []
-    for resolved_part in resolved_parts:
-        step_path = resolved_part.step_path.resolve()
-        shape = _load_step_shape(step_path)
-        source_color = _source_color_for_cad_ref(resolved_part.cad_ref)
-        if source_color is not None:
-            shape.color = build123d.Color(*source_color)
-        child = shape.moved(_location_from_transform(resolved_part.transform))
-        if source_color is not None:
-            child.color = build123d.Color(*source_color)
-        child.label = _component_name(resolved_part.instance_path)
-        children.append(child)
 
+def _build_node_shape(
+    node: AssemblyNodeSpec,
+    *,
+    resolve_entry,
+    instance_path: tuple[str, ...],
+    parent_use_source_colors: bool,
+    stack: tuple[str, ...],
+):
+    import build123d
+
+    component_path = (*instance_path, node.instance_id) if instance_path else (node.instance_id,)
+    label = _component_name(component_path)
+    use_source_colors = parent_use_source_colors and node.use_source_colors
+
+    if node.children:
+        child_shapes = [
+            _build_node_shape(
+                child,
+                resolve_entry=resolve_entry,
+                instance_path=component_path,
+                parent_use_source_colors=use_source_colors,
+                stack=stack,
+            )
+            for child in node.children
+        ]
+        shape = build123d.Compound(obj=child_shapes, children=child_shapes, label=label)
+    else:
+        if node.source_path is None or node.path is None:
+            raise RuntimeError(f"Assembly node {label} is missing a STEP source path")
+        child_entry = resolve_entry(node.source_path)
+        if child_entry is None:
+            raise RuntimeError(f"Assembly node {label} references missing CAD source {node.path}")
+        if child_entry.kind == "assembly":
+            if child_entry.assembly_spec is None:
+                raise RuntimeError(f"Assembly source {child_entry.source_ref} is missing assembly spec data")
+            stack_key = child_entry.source_ref
+            if stack_key in stack:
+                cycle = " -> ".join((*stack, stack_key))
+                raise RuntimeError(f"Assembly cycle detected: {cycle}")
+            shape = _compound_from_nodes(
+                assembly_spec_children(child_entry.assembly_spec),
+                label=label,
+                resolve_entry=resolve_entry,
+                instance_path=component_path,
+                parent_use_source_colors=use_source_colors,
+                stack=(*stack, stack_key),
+            )
+        elif child_entry.kind == "part":
+            shape = _shape_for_part_entry(child_entry, label=label, use_source_colors=use_source_colors)
+        else:
+            raise RuntimeError(f"Assembly node {label} resolved to unsupported CAD source kind: {child_entry.kind}")
+
+    moved = shape.moved(_location_from_transform(node.transform))
+    moved.label = label
+    if not use_source_colors:
+        _clear_shape_colors(moved)
+    return moved
+
+
+def _compound_from_nodes(
+    nodes: Sequence[AssemblyNodeSpec],
+    *,
+    label: str,
+    resolve_entry,
+    instance_path: tuple[str, ...] = (),
+    parent_use_source_colors: bool,
+    stack: tuple[str, ...],
+):
+    import build123d
+
+    children = [
+        _build_node_shape(
+            node,
+            resolve_entry=resolve_entry,
+            instance_path=instance_path,
+            parent_use_source_colors=parent_use_source_colors,
+            stack=stack,
+        )
+        for node in nodes
+    ]
+    if not children:
+        raise RuntimeError(f"Assembly {label} has no resolved STEP instances")
     return build123d.Compound(
         obj=children,
         children=children,
+        label=label,
+    )
+
+
+def build_assembly_compound(assembly_spec: AssemblySpec, *, label: str | None = None):
+    root_source = filesystem_entry(assembly_spec.assembly_path)
+    root_source_ref = root_source.source_ref if root_source is not None else _relative_to_repo(assembly_spec.assembly_path)
+    return _compound_from_nodes(
+        assembly_spec_children(assembly_spec),
         label=label or Path(assembly_spec.assembly_path).stem,
+        resolve_entry=filesystem_entry,
+        parent_use_source_colors=True,
+        stack=(root_source_ref,),
     )
 
 

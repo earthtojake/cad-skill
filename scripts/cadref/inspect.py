@@ -139,10 +139,7 @@ def _load_entry_context(cad_path: str, *, profile: SelectorProfile) -> EntryCont
 
 
 def _cad_path_lookup_candidates(cad_path: str) -> tuple[str, ...]:
-    candidates = [cad_path]
-    if cad_path.startswith("models/"):
-        candidates.append(cad_path[len("models/") :])
-    return tuple(dict.fromkeys(candidate for candidate in candidates if candidate))
+    return (cad_path,) if cad_path else ()
 
 
 def _lookup_cad_path(cad_path: str) -> str:
@@ -191,11 +188,32 @@ def _selection_summary(selector_type: str, row: dict[str, object]) -> str:
     return f"corner edges={row.get('edgeCount')}"
 
 
-def _occurrence_detail(row: dict[str, object]) -> dict[str, object]:
+def _occurrence_detail(row: dict[str, object], selector_index: lookup.SelectorIndex) -> dict[str, object]:
+    occurrence_id = str(row.get("id") or "").strip()
+    child_rows = [
+        child
+        for child in selector_index.occurrences
+        if str(child.get("parentId") or "").strip() == occurrence_id
+    ]
+    descendant_ids: list[str] = []
+    stack = list(reversed(child_rows))
+    while stack:
+        child = stack.pop()
+        child_id = str(child.get("id") or "").strip()
+        if child_id:
+            descendant_ids.append(lookup.display_selector(child_id, selector_index))
+            stack.extend(
+                grandchild
+                for grandchild in reversed(selector_index.occurrences)
+                if str(grandchild.get("parentId") or "").strip() == child_id
+            )
     return {
         "path": row.get("path"),
         "name": row.get("name"),
         "sourceName": row.get("sourceName"),
+        "parentId": lookup.display_selector(str(row.get("parentId") or ""), selector_index),
+        "childCount": len(child_rows),
+        "descendantOccurrenceIds": descendant_ids,
         "transform": row.get("transform"),
         "bbox": row.get("bbox"),
         "shapeCount": row.get("shapeCount"),
@@ -333,7 +351,7 @@ def _inspect_selector(
     }
     if detail:
         if selector_type == "occurrence":
-            selection["detail"] = _occurrence_detail(row)
+            selection["detail"] = _occurrence_detail(row, context.selector_index)
         elif selector_type == "shape":
             selection["detail"] = _shape_detail(row, context.selector_index)
         elif selector_type == "face":

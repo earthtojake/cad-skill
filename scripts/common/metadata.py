@@ -10,6 +10,8 @@ REPO_ROOT = Path.cwd().resolve()
 CAD_ROOT = REPO_ROOT
 DEFAULT_STL_TOLERANCE = 0.1
 DEFAULT_STL_ANGULAR_TOLERANCE = 0.1
+DEFAULT_3MF_TOLERANCE = DEFAULT_STL_TOLERANCE
+DEFAULT_3MF_ANGULAR_TOLERANCE = DEFAULT_STL_ANGULAR_TOLERANCE
 DEFAULT_GLB_TOLERANCE = 0.1
 DEFAULT_GLB_ANGULAR_TOLERANCE = 0.1
 
@@ -31,11 +33,15 @@ class GeneratorMetadata:
     has_gen_urdf: bool
     step_output: str | None
     stl_output: str | None
+    three_mf_output: str | None
     dxf_output: str | None
     urdf_output: str | None
     export_stl: bool
+    export_3mf: bool
     stl_tolerance: float | None
     stl_angular_tolerance: float | None
+    three_mf_tolerance: float | None
+    three_mf_angular_tolerance: float | None
     glb_tolerance: float | None
     glb_angular_tolerance: float | None
     skip_topology: bool
@@ -45,9 +51,13 @@ class GeneratorMetadata:
 class StepEnvelopeMetadata:
     step_output: str | None
     stl_output: str | None
+    three_mf_output: str | None
     export_stl: bool
+    export_3mf: bool
     stl_tolerance: float | None
     stl_angular_tolerance: float | None
+    three_mf_tolerance: float | None
+    three_mf_angular_tolerance: float | None
     glb_tolerance: float | None
     glb_angular_tolerance: float | None
     skip_topology: bool
@@ -56,22 +66,32 @@ class StepEnvelopeMetadata:
 STEP_ENVELOPE_FIELDS = {
     "shape",
     "instances",
+    "children",
     "step_output",
     "stl_output",
+    "3mf_output",
     "export_stl",
+    "export_3mf",
     "stl_tolerance",
     "stl_angular_tolerance",
+    "3mf_tolerance",
+    "3mf_angular_tolerance",
     "glb_tolerance",
     "glb_angular_tolerance",
     "skip_topology",
 }
 DXF_ENVELOPE_FIELDS = {"document", "dxf_output"}
-URDF_ENVELOPE_FIELDS = {"xml", "urdf_output"}
+URDF_ENVELOPE_FIELDS = {"xml", "urdf_output", "explorer_metadata"}
 
 
 DEFAULT_STL_SETTINGS = MeshSettings(
     tolerance=DEFAULT_STL_TOLERANCE,
     angular_tolerance=DEFAULT_STL_ANGULAR_TOLERANCE,
+)
+
+DEFAULT_3MF_SETTINGS = MeshSettings(
+    tolerance=DEFAULT_3MF_TOLERANCE,
+    angular_tolerance=DEFAULT_3MF_ANGULAR_TOLERANCE,
 )
 
 DEFAULT_GLB_SETTINGS = MeshSettings(
@@ -128,6 +148,29 @@ def resolve_stl_settings(
     )
 
 
+def resolve_3mf_settings(
+    *,
+    cad_ref: str,
+    generator_metadata: GeneratorMetadata | None,
+    three_mf_tolerance: float | None = None,
+    three_mf_angular_tolerance: float | None = None,
+) -> MeshSettings:
+    tolerance = DEFAULT_3MF_SETTINGS.tolerance
+    angular_tolerance = DEFAULT_3MF_SETTINGS.angular_tolerance
+    if generator_metadata is not None and generator_metadata.three_mf_tolerance is not None:
+        tolerance = generator_metadata.three_mf_tolerance
+    if generator_metadata is not None and generator_metadata.three_mf_angular_tolerance is not None:
+        angular_tolerance = generator_metadata.three_mf_angular_tolerance
+    if three_mf_tolerance is not None:
+        tolerance = three_mf_tolerance
+    if three_mf_angular_tolerance is not None:
+        angular_tolerance = three_mf_angular_tolerance
+    return MeshSettings(
+        tolerance=tolerance,
+        angular_tolerance=angular_tolerance,
+    )
+
+
 def resolve_glb_settings(
     *,
     cad_ref: str,
@@ -168,9 +211,13 @@ def parse_generator_metadata(script_path: Path) -> GeneratorMetadata | None:
     step_metadata = StepEnvelopeMetadata(
         step_output=None,
         stl_output=None,
+        three_mf_output=None,
         export_stl=False,
+        export_3mf=False,
         stl_tolerance=None,
         stl_angular_tolerance=None,
+        three_mf_tolerance=None,
+        three_mf_angular_tolerance=None,
         glb_tolerance=None,
         glb_angular_tolerance=None,
         skip_topology=False,
@@ -244,11 +291,15 @@ def parse_generator_metadata(script_path: Path) -> GeneratorMetadata | None:
         has_gen_urdf=has_gen_urdf,
         step_output=step_metadata.step_output,
         stl_output=step_metadata.stl_output,
+        three_mf_output=step_metadata.three_mf_output,
         dxf_output=dxf_output,
         urdf_output=urdf_output,
         export_stl=step_metadata.export_stl,
+        export_3mf=step_metadata.export_3mf,
         stl_tolerance=step_metadata.stl_tolerance,
         stl_angular_tolerance=step_metadata.stl_angular_tolerance,
+        three_mf_tolerance=step_metadata.three_mf_tolerance,
+        three_mf_angular_tolerance=step_metadata.three_mf_angular_tolerance,
         glb_tolerance=step_metadata.glb_tolerance,
         glb_angular_tolerance=step_metadata.glb_angular_tolerance,
         skip_topology=step_metadata.skip_topology,
@@ -269,10 +320,17 @@ def _parse_step_envelope_metadata(
     )
     has_shape = "shape" in envelope
     has_instances = "instances" in envelope
-    if has_shape == has_instances:
+    has_children = "children" in envelope
+    has_assembly = has_instances or has_children
+    if has_instances and has_children:
+        raise ValueError(
+            f"{script_path.relative_to(REPO_ROOT)} gen_step() envelope must define only one of "
+            "'instances' or 'children'"
+        )
+    if has_shape == has_assembly:
         raise ValueError(
             f"{script_path.relative_to(REPO_ROOT)} gen_step() envelope must define exactly one of "
-            "'shape' or 'instances'"
+            "'shape', 'instances', or 'children'"
         )
     kind = "part" if has_shape else "assembly"
     export_stl = _parse_bool_field(
@@ -280,6 +338,12 @@ def _parse_step_envelope_metadata(
         function_name=function.name,
         envelope=envelope,
         field_name="export_stl",
+    )
+    export_3mf = _parse_bool_field(
+        script_path=script_path,
+        function_name=function.name,
+        envelope=envelope,
+        field_name="export_3mf",
     )
     skip_topology = _parse_bool_field(
         script_path=script_path,
@@ -300,7 +364,14 @@ def _parse_step_envelope_metadata(
             envelope=envelope,
             field_name="stl_output",
         ),
+        three_mf_output=_parse_path_field(
+            script_path=script_path,
+            function_name=function.name,
+            envelope=envelope,
+            field_name="3mf_output",
+        ),
         export_stl=export_stl,
+        export_3mf=export_3mf,
         stl_tolerance=_parse_mesh_numeric_field(
             script_path=script_path,
             function_name=function.name,
@@ -312,6 +383,18 @@ def _parse_step_envelope_metadata(
             function_name=function.name,
             envelope=envelope,
             field_name="stl_angular_tolerance",
+        ),
+        three_mf_tolerance=_parse_mesh_numeric_field(
+            script_path=script_path,
+            function_name=function.name,
+            envelope=envelope,
+            field_name="3mf_tolerance",
+        ),
+        three_mf_angular_tolerance=_parse_mesh_numeric_field(
+            script_path=script_path,
+            function_name=function.name,
+            envelope=envelope,
+            field_name="3mf_angular_tolerance",
         ),
         glb_tolerance=_parse_mesh_numeric_field(
             script_path=script_path,

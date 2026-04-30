@@ -39,7 +39,7 @@ class CadgenRenderTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "no configured STL output"):
             cad_render.part_stl_path(step_path)
 
-    def test_viewer_paths_use_step_artifact_directory(self) -> None:
+    def test_explorer_paths_use_step_artifact_directory(self) -> None:
         step_path = self._write_step("part")
 
         glb_path = cad_render.part_glb_path(step_path)

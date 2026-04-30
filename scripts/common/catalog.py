@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+from collections.abc import Sequence
 from dataclasses import dataclass
 from fnmatch import fnmatch
 from pathlib import Path, PurePosixPath
@@ -11,7 +12,7 @@ from .metadata import GeneratorMetadata, normalize_mesh_numeric, parse_generator
 REPO_ROOT = Path.cwd().resolve()
 CAD_ROOT = REPO_ROOT
 STEP_SUFFIXES = (".step", ".stp")
-VIEWER_ARTIFACT_FILENAMES = {
+EXPLORER_ARTIFACT_FILENAMES = {
     ".glb": "model.glb",
     ".topology.json": "topology.json",
     ".topology.bin": "topology.bin",
@@ -36,7 +37,7 @@ IGNORED_DISCOVERY_DIR_NAMES = {
     "site-packages",
     "venv",
 }
-GENERATOR_NAME_MARKERS = (b"gen_step", b"gen_dxf", b"gen_urdf")
+GENERATOR_NAME_MARKERS = (b"gen_step",)
 
 
 class CadSourceError(ValueError):
@@ -49,6 +50,10 @@ class StepImportOptions:
     stl_output: str | None = None
     stl_tolerance: float | None = None
     stl_angular_tolerance: float | None = None
+    export_3mf: bool = False
+    three_mf_output: str | None = None
+    three_mf_tolerance: float | None = None
+    three_mf_angular_tolerance: float | None = None
     glb_tolerance: float | None = None
     glb_angular_tolerance: float | None = None
     color: tuple[float, float, float, float] | None = None
@@ -62,6 +67,10 @@ class StepImportOptions:
                 self.stl_output is not None,
                 self.stl_tolerance is not None,
                 self.stl_angular_tolerance is not None,
+                self.export_3mf,
+                self.three_mf_output is not None,
+                self.three_mf_tolerance is not None,
+                self.three_mf_angular_tolerance is not None,
                 self.glb_tolerance is not None,
                 self.glb_angular_tolerance is not None,
                 self.color is not None,
@@ -82,11 +91,15 @@ class CadSource:
     generator_metadata: GeneratorMetadata | None = None
     step_path: Path | None = None
     stl_path: Path | None = None
+    three_mf_path: Path | None = None
     dxf_path: Path | None = None
     urdf_path: Path | None = None
     export_stl: bool = False
+    export_3mf: bool = False
     stl_tolerance: float | None = None
     stl_angular_tolerance: float | None = None
+    three_mf_tolerance: float | None = None
+    three_mf_angular_tolerance: float | None = None
     glb_tolerance: float | None = None
     glb_angular_tolerance: float | None = None
     color: tuple[float, float, float, float] | None = None
@@ -95,7 +108,7 @@ class CadSource:
     @property
     def selector_manifest_path(self) -> Path | None:
         return (
-            viewer_artifact_path_for_step_path(self.step_path, ".topology.json")
+            explorer_artifact_path_for_step_path(self.step_path, ".topology.json")
             if self.step_path is not None and not self.skip_topology
             else None
         )
@@ -103,14 +116,14 @@ class CadSource:
     @property
     def selector_binary_path(self) -> Path | None:
         return (
-            viewer_artifact_path_for_step_path(self.step_path, ".topology.bin")
+            explorer_artifact_path_for_step_path(self.step_path, ".topology.bin")
             if self.step_path is not None and not self.skip_topology
             else None
         )
 
     @property
     def glb_path(self) -> Path | None:
-        return viewer_artifact_path_for_step_path(self.step_path, ".glb") if self.step_path is not None else None
+        return explorer_artifact_path_for_step_path(self.step_path, ".glb") if self.step_path is not None else None
 
     @property
     def generated_paths(self) -> tuple[Path, ...]:
@@ -124,6 +137,8 @@ class CadSource:
                 paths.append(self.urdf_path)
         if self.export_stl and self.stl_path is not None:
             paths.append(self.stl_path)
+        if self.export_3mf and self.three_mf_path is not None:
+            paths.append(self.three_mf_path)
         if self.glb_path is not None:
             paths.append(self.glb_path)
         if self.selector_manifest_path is not None:
@@ -286,17 +301,17 @@ def hidden_artifact_path_for_step_path(step_path: Path, suffix: str) -> Path:
     return base.with_name(f".{base.stem}{suffix}").resolve()
 
 
-def viewer_directory_for_step_path(step_path: Path) -> Path:
+def explorer_directory_for_step_path(step_path: Path) -> Path:
     base = step_path.resolve()
     return (base.parent / f".{base.name}").resolve()
 
 
-def viewer_artifact_path_for_step_path(step_path: Path, suffix: str) -> Path:
+def explorer_artifact_path_for_step_path(step_path: Path, suffix: str) -> Path:
     base = step_path.resolve()
-    artifact_name = VIEWER_ARTIFACT_FILENAMES.get(suffix)
+    artifact_name = EXPLORER_ARTIFACT_FILENAMES.get(suffix)
     if artifact_name is None:
-        raise ValueError(f"Unsupported STEP viewer artifact suffix: {suffix}")
-    return (viewer_directory_for_step_path(base) / artifact_name).resolve()
+        raise ValueError(f"Unsupported STEP explorer artifact suffix: {suffix}")
+    return (explorer_directory_for_step_path(base) / artifact_name).resolve()
 
 
 def _iter_python_sources(root: Path) -> tuple[CadSource, ...]:
@@ -338,6 +353,10 @@ def _read_python_source(script_path: Path) -> CadSource | None:
         raise CadSourceError(
             f"{_relative_to_repo(resolved_script_path)} stl_output requires export_stl = True"
         )
+    if metadata.three_mf_output is not None and not metadata.export_3mf:
+        raise CadSourceError(
+            f"{_relative_to_repo(resolved_script_path)} 3mf_output requires export_3mf = True"
+        )
     dxf_path = (
         _resolve_configured_artifact_path(
             _required_output(metadata.dxf_output, script_path=resolved_script_path, field_name="dxf_output"),
@@ -371,6 +390,17 @@ def _read_python_source(script_path: Path) -> CadSource | None:
         if metadata.export_stl
         else None
     )
+    three_mf_path = (
+        _resolve_configured_artifact_path(
+            _required_output(metadata.three_mf_output, script_path=resolved_script_path, field_name="3mf_output"),
+            base_path=resolved_script_path,
+            default_path=None,
+            expected_suffixes=(".3mf",),
+            field_name="3mf_output",
+        )
+        if metadata.export_3mf
+        else None
+    )
     return CadSource(
         source_ref=source_ref_from_path(resolved_script_path),
         cad_ref=cad_ref_from_step_path(step_path),
@@ -382,11 +412,15 @@ def _read_python_source(script_path: Path) -> CadSource | None:
         generator_metadata=metadata,
         step_path=step_path,
         stl_path=stl_path,
+        three_mf_path=three_mf_path,
         dxf_path=dxf_path,
         urdf_path=urdf_path,
         export_stl=metadata.export_stl,
+        export_3mf=metadata.export_3mf,
         stl_tolerance=metadata.stl_tolerance,
         stl_angular_tolerance=metadata.stl_angular_tolerance,
+        three_mf_tolerance=metadata.three_mf_tolerance,
+        three_mf_angular_tolerance=metadata.three_mf_angular_tolerance,
         glb_tolerance=metadata.glb_tolerance,
         glb_angular_tolerance=metadata.glb_angular_tolerance,
         skip_topology=metadata.skip_topology,
@@ -431,6 +465,14 @@ def _read_step_source(
         raise CadSourceError(
             f"{_relative_to_repo(resolved_step_path)} stl_output is required when export_stl = true"
         )
+    if options.three_mf_output is not None and not options.export_3mf:
+        raise CadSourceError(
+            f"{_relative_to_repo(resolved_step_path)} 3mf_output requires export_3mf = true"
+        )
+    if options.export_3mf and options.three_mf_output is None:
+        raise CadSourceError(
+            f"{_relative_to_repo(resolved_step_path)} 3mf_output is required when export_3mf = true"
+        )
     stl_path = (
         _resolve_configured_artifact_path(
             options.stl_output,
@@ -440,6 +482,17 @@ def _read_step_source(
             field_name="stl_output",
         )
         if options.export_stl
+        else None
+    )
+    three_mf_path = (
+        _resolve_configured_artifact_path(
+            options.three_mf_output,
+            base_path=resolved_step_path,
+            default_path=None,
+            expected_suffixes=(".3mf",),
+            field_name="3mf_output",
+        )
+        if options.export_3mf
         else None
     )
 
@@ -454,7 +507,9 @@ def _read_step_source(
         origin_path=resolved_step_path,
         step_path=resolved_step_path,
         stl_path=stl_path,
+        three_mf_path=three_mf_path,
         export_stl=options.export_stl,
+        export_3mf=options.export_3mf,
         stl_tolerance=normalize_step_numeric(
             options.stl_tolerance,
             base_path=resolved_step_path,
@@ -464,6 +519,16 @@ def _read_step_source(
             options.stl_angular_tolerance,
             base_path=resolved_step_path,
             field_name="stl_angular_tolerance",
+        ),
+        three_mf_tolerance=normalize_step_numeric(
+            options.three_mf_tolerance,
+            base_path=resolved_step_path,
+            field_name="3mf_tolerance",
+        ),
+        three_mf_angular_tolerance=normalize_step_numeric(
+            options.three_mf_angular_tolerance,
+            base_path=resolved_step_path,
+            field_name="3mf_angular_tolerance",
         ),
         glb_tolerance=normalize_step_numeric(
             options.glb_tolerance,
@@ -530,7 +595,11 @@ def normalize_step_color(
             components = [int(value[index : index + 2], 16) / 255.0 for index in range(0, len(value), 2)]
         except ValueError as exc:
             raise CadSourceError(f"{_relative_to_repo(base_path)} {field_name} must be valid hex") from exc
-    elif isinstance(raw_value, list) and len(raw_value) in {3, 4}:
+    elif (
+        isinstance(raw_value, Sequence)
+        and not isinstance(raw_value, (bytes, bytearray))
+        and len(raw_value) in {3, 4}
+    ):
         components = []
         for component in raw_value:
             try:

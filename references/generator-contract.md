@@ -1,11 +1,11 @@
 # CAD Generator Contract
 
-Use this reference when creating or editing STEP, DXF, STL, GLB/topology, or imported STEP sources.
+Use this reference when creating or editing STEP, DXF, STL, 3MF, GLB/topology, or imported STEP sources.
 
 ## Source Types
 
 - A generated part is a Python file with a top-level zero-argument `gen_step()` returning an envelope with `shape` and `step_output`.
-- A generated assembly is a Python file with a top-level zero-argument `gen_step()` returning an envelope with `instances` and `step_output`.
+- A generated assembly is a Python file with a top-level zero-argument `gen_step()` returning an envelope with either flat `instances` or recursive `children`, plus `step_output`.
 - A generated part may also define `gen_dxf()` returning an envelope with `document` and `dxf_output`.
 - Imported STEP/STP entries are targeted directly with `gen_step_part` or `gen_step_assembly`.
 - Direct imported parts intentionally have no Python generator; do not create placeholder generators for them.
@@ -33,6 +33,9 @@ Optional fields include:
 - `export_stl`: boolean
 - `stl_output`: relative path to generated `.stl` output when STL export is enabled
 - `stl_tolerance`, `stl_angular_tolerance`
+- `export_3mf`: boolean
+- `3mf_output`: relative path to generated `.3mf` output when 3MF export is enabled
+- `3mf_tolerance`, `3mf_angular_tolerance`
 - `glb_tolerance`, `glb_angular_tolerance`
 - `skip_topology`: for parts that should emit GLB without selector topology sidecars
 
@@ -45,16 +48,33 @@ Optional fields include:
 
 `gen_step()` for assemblies must return:
 
-- `instances`: list of assembly instances
+- exactly one of `instances` or `children`
 - `step_output`: relative path to generated `.step` output
 
-Each instance must define:
+Flat `instances` remain supported for simple assemblies and backward compatibility. Each instance must define:
 
 - `path`: STEP/STP path relative to the assembly generator file
 - `name`: selector-safe instance name containing only letters, numbers, `.`, `_`, or `-`
 - `transform`: 16-number row-major transform
 
-Assembly STEP generation resolves instance paths relative to the generator file. It does not require a harness root or catalog entry for each instance; the referenced STEP/STP file must exist.
+Recursive `children` define a semantic occurrence tree. Each node must define:
+
+- `name`: selector-safe instance name containing only letters, numbers, `.`, `_`, or `-`
+- `transform`: 16-number row-major transform
+
+Each child node may also define:
+
+- `path`: STEP/STP path relative to the assembly generator file
+- `children`: non-empty list of child nodes
+- `use_source_colors`: boolean, default `true`; set `false` when the assembly should render that node with explorer default material settings instead of referenced source colors
+
+Nodes with `children` are subassemblies. Nodes with `path` and no `children` are leaf component instances unless the path resolves to a generated assembly source, in which case that generated assembly is expanded as a subassembly root. Sibling `name` values must be unique at every level. Empty subassemblies, invalid names, absolute paths, backslash paths, and `.` path segments are rejected.
+
+Flat instances may also define:
+
+- `use_source_colors`: boolean, default `true`; set `false` when the assembly should render that instance with explorer default material settings instead of the referenced STEP/GLB source colors
+
+Assembly STEP generation resolves instance and child node paths relative to the generator file. The referenced STEP/STP file must exist. Generated assembly exports preserve recursive labels where possible, while explorer mesh composition still loads only descendant leaf GLB assets.
 
 ## Imported STEP/STP Targets
 
@@ -68,6 +88,9 @@ Optional CLI flags for direct imported targets include:
 - `--export-stl`
 - `--stl-output`
 - `--stl-tolerance`, `--stl-angular-tolerance`
+- `--export-3mf`
+- `--3mf-output`
+- `--3mf-tolerance`, `--3mf-angular-tolerance`
 - `--glb-tolerance`, `--glb-angular-tolerance`
 - `--color`
 - `--skip-topology` for parts
@@ -83,7 +106,7 @@ Envelope output fields and CLI output fields:
 - must use the correct artifact suffix
 - are resolved as file paths, not through a harness root
 
-The host project may impose its own layout policy, such as keeping outputs under a `models/` directory, but the CAD skill runtime does not hardcode that convention.
+The host project may impose its own layout policy, but the CAD skill runtime does not hardcode one.
 
 ## Generated Artifacts
 

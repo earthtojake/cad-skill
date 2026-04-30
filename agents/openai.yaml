@@ -1,4 +1,4 @@
 interface:
   display_name: "CAD"
-  short_description: "Create, regenerate, inspect, and validate explicit CAD files."
-  default_prompt: "Use $cad to create, edit, regenerate, inspect, and validate explicit STEP, STL, DXF, GLB/topology, snapshot, and CAD prompt-reference workflows without assuming a harness root."
+  short_description: "Generate CAD and hand off Explorer links."
+  default_prompt: "Use $cad to create, regenerate, inspect, validate, and hand off CAD Explorer links for explicit CAD files and @cad references."

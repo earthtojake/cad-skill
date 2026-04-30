@@ -25,7 +25,8 @@ from OCP.STEPCAFControl import STEPCAFControl_Reader
 from OCP.STEPControl import STEPControl_Reader
 from OCP.TCollection import TCollection_ExtendedString
 from OCP.TDataStd import TDataStd_Name
-from OCP.TDF import TDF_Label, TDF_LabelSequence
+from OCP.Quantity import Quantity_ColorRGBA
+from OCP.TDF import TDF_ChildIterator, TDF_Label, TDF_LabelSequence
 from OCP.TDocStd import TDocStd_Document
 from OCP.TopAbs import (
     TopAbs_EDGE,
@@ -40,10 +41,18 @@ from OCP.TopLoc import TopLoc_Location
 from OCP.TopTools import TopTools_IndexedMapOfShape
 from OCP.TopoDS import TopoDS, TopoDS_Compound
 from OCP.XCAFApp import XCAFApp_Application
-from OCP.XCAFDoc import XCAFDoc_DocumentTool, XCAFDoc_ShapeTool
+from OCP.XCAFDoc import (
+    XCAFDoc_ColorCurv,
+    XCAFDoc_ColorGen,
+    XCAFDoc_ColorSurf,
+    XCAFDoc_ColorTool,
+    XCAFDoc_DocumentTool,
+    XCAFDoc_ShapeTool,
+)
 
 
 REPO_ROOT = Path.cwd().resolve()
+ColorRGBA = tuple[float, float, float, float]
 
 
 class SelectorProfile(str, Enum):
@@ -74,6 +83,9 @@ class LoadedStepScene:
     step_path: Path
     roots: list["OccurrenceNode"]
     prototype_shapes: dict[int, Any]
+    prototype_names: dict[int, str | None] = field(default_factory=dict)
+    prototype_colors: dict[int, ColorRGBA] = field(default_factory=dict)
+    prototype_face_colors: dict[int, dict[int, ColorRGBA]] = field(default_factory=dict)
     load_elapsed: float = 0.0
     step_hash: str | None = None
     mesh_signature: tuple[float, float, bool] | None = None
@@ -87,6 +99,8 @@ class OccurrenceNode:
     source_name: str | None
     transform: tuple[float, ...]
     prototype_key: int | None
+    local_transform: tuple[float, ...] = field(default_factory=lambda: _identity_transform_matrix())
+    color: ColorRGBA | None = None
     location: object | None = None
     children: list["OccurrenceNode"] = field(default_factory=list)
     row_index: int = -1
@@ -634,6 +648,69 @@ def _resolve_referred_label(shape_tool: Any, label: object) -> object:
     return label
 
 
+def _color_tuple(color: Quantity_ColorRGBA) -> ColorRGBA:
+    rgb = color.GetRGB()
+    return (
+        float(rgb.Red()),
+        float(rgb.Green()),
+        float(rgb.Blue()),
+        float(color.Alpha()),
+    )
+
+
+def _color_from_label(color_tool: Any, label: object) -> ColorRGBA | None:
+    color = Quantity_ColorRGBA()
+    for color_type in (XCAFDoc_ColorSurf, XCAFDoc_ColorGen, XCAFDoc_ColorCurv):
+        try:
+            if XCAFDoc_ColorTool.GetColor_s(label, color_type, color):
+                return _color_tuple(color)
+        except Exception:
+            continue
+    return None
+
+
+def _color_from_shape(color_tool: Any, shape: object) -> ColorRGBA | None:
+    if getattr(shape, "IsNull", lambda: True)():
+        return None
+    color = Quantity_ColorRGBA()
+    for color_type in (XCAFDoc_ColorSurf, XCAFDoc_ColorGen, XCAFDoc_ColorCurv):
+        try:
+            if color_tool.GetColor(shape, color_type, color):
+                return _color_tuple(color)
+        except Exception:
+            pass
+        try:
+            if color_tool.GetInstanceColor(shape, color_type, color):
+                return _color_tuple(color)
+        except Exception:
+            pass
+    return None
+
+
+def _face_color_map_from_label(shape_tool: Any, color_tool: Any, label: object) -> dict[int, ColorRGBA]:
+    face_colors: dict[int, ColorRGBA] = {}
+
+    def collect(colored_label: object) -> None:
+        label_color = _color_from_label(color_tool, colored_label)
+        if label_color is not None:
+            try:
+                shape = shape_tool.GetShape_s(colored_label)
+            except Exception:
+                shape = None
+            if shape is not None and not shape.IsNull():
+                explorer = TopExp_Explorer(shape, TopAbs_FACE)
+                while explorer.More():
+                    face_colors[_shape_hash(TopoDS.Face_s(explorer.Current()))] = label_color
+                    explorer.Next()
+        iterator = TDF_ChildIterator(colored_label, False)
+        while iterator.More():
+            collect(iterator.Value())
+            iterator.Next()
+
+    collect(label)
+    return face_colors
+
+
 def _xcaf_children(shape_tool: Any, label: object, resolved_label: object) -> list[object]:
     children = TDF_LabelSequence()
     has_children = XCAFDoc_ShapeTool.GetComponents_s(label, children, False)
@@ -645,7 +722,9 @@ def _xcaf_children(shape_tool: Any, label: object, resolved_label: object) -> li
     return [children.Value(index) for index in range(1, children.Length() + 1)]
 
 
-def _load_occurrence_tree(step_path: Path) -> tuple[list[OccurrenceNode], dict[int, Any]]:
+def _load_occurrence_tree(
+    step_path: Path,
+) -> tuple[list[OccurrenceNode], dict[int, Any], dict[int, str | None], dict[int, ColorRGBA], dict[int, dict[int, ColorRGBA]]]:
     app = XCAFApp_Application.GetApplication_s()
     doc = TDocStd_Document(TCollection_ExtendedString("step-selectors"))
     app.NewDocument(TCollection_ExtendedString("MDTV-XCAF"), doc)
@@ -653,6 +732,10 @@ def _load_occurrence_tree(step_path: Path) -> tuple[list[OccurrenceNode], dict[i
     reader = STEPCAFControl_Reader()
     reader.SetColorMode(True)
     reader.SetNameMode(True)
+    for mode_name in ("SetMatMode", "SetLayerMode", "SetSHUOMode"):
+        mode = getattr(reader, mode_name, None)
+        if callable(mode):
+            mode(True)
     read_status = reader.ReadFile(str(step_path))
     if int(read_status) != int(IFSelect_RetDone):
         return _load_fallback_occurrence_tree(step_path)
@@ -660,22 +743,33 @@ def _load_occurrence_tree(step_path: Path) -> tuple[list[OccurrenceNode], dict[i
         return _load_fallback_occurrence_tree(step_path)
 
     shape_tool = XCAFDoc_DocumentTool.ShapeTool_s(doc.Main())
+    color_tool = XCAFDoc_DocumentTool.ColorTool_s(doc.Main())
     free_labels = TDF_LabelSequence()
     shape_tool.GetFreeShapes(free_labels)
     if free_labels.Length() <= 0:
         return _load_fallback_occurrence_tree(step_path)
 
     prototypes: dict[int, Any] = {}
+    prototype_names: dict[int, str | None] = {}
+    prototype_colors: dict[int, ColorRGBA] = {}
+    prototype_face_colors: dict[int, dict[int, ColorRGBA]] = {}
 
     def collect(label: object, *, path: tuple[int, ...], parent_location: object | None = None) -> OccurrenceNode | None:
         resolved_label = _resolve_referred_label(shape_tool, label)
         instance_shape = shape_tool.GetShape_s(label)
         resolved_shape = shape_tool.GetShape_s(resolved_label)
         base_shape = instance_shape if not instance_shape.IsNull() else resolved_shape
-        current_location = _compose_locations(parent_location, _shape_location(base_shape))
+        local_location = _shape_location(base_shape)
+        current_location = _compose_locations(parent_location, local_location)
         children = _xcaf_children(shape_tool, label, resolved_label)
         name = _label_name(label) or _label_name(resolved_label)
         source_name = _label_name(resolved_label) or name
+        occurrence_color = (
+            _color_from_label(color_tool, label)
+            or _color_from_shape(color_tool, instance_shape)
+            or _color_from_label(color_tool, resolved_label)
+            or _color_from_shape(color_tool, resolved_shape)
+        )
         prototype_key: int | None = None
         if not children and not resolved_shape.IsNull():
             prototype_key = _shape_hash(resolved_shape)
@@ -683,6 +777,16 @@ def _load_occurrence_tree(step_path: Path) -> tuple[list[OccurrenceNode], dict[i
         elif not children and not base_shape.IsNull():
             prototype_key = _shape_hash(base_shape)
             prototypes.setdefault(prototype_key, base_shape)
+        if prototype_key is not None:
+            prototype_names.setdefault(prototype_key, source_name or name)
+            prototype_color = _color_from_label(color_tool, resolved_label) or _color_from_shape(color_tool, resolved_shape)
+            if prototype_color is not None:
+                prototype_colors.setdefault(prototype_key, prototype_color)
+            face_colors = _face_color_map_from_label(shape_tool, color_tool, resolved_label)
+            if label != resolved_label:
+                face_colors.update(_face_color_map_from_label(shape_tool, color_tool, label))
+            if face_colors:
+                prototype_face_colors.setdefault(prototype_key, {}).update(face_colors)
         child_nodes = [
             child_node
             for index, child in enumerate(children, start=1)
@@ -696,6 +800,8 @@ def _load_occurrence_tree(step_path: Path) -> tuple[list[OccurrenceNode], dict[i
             source_name=source_name,
             transform=_location_transform_matrix(current_location),
             prototype_key=prototype_key,
+            local_transform=_location_transform_matrix(local_location),
+            color=occurrence_color,
             location=current_location,
             children=child_nodes,
         )
@@ -707,10 +813,12 @@ def _load_occurrence_tree(step_path: Path) -> tuple[list[OccurrenceNode], dict[i
     ]
     if not roots:
         return _load_fallback_occurrence_tree(step_path)
-    return roots, prototypes
+    return roots, prototypes, prototype_names, prototype_colors, prototype_face_colors
 
 
-def _load_fallback_occurrence_tree(step_path: Path) -> tuple[list[OccurrenceNode], dict[int, Any]]:
+def _load_fallback_occurrence_tree(
+    step_path: Path,
+) -> tuple[list[OccurrenceNode], dict[int, Any], dict[int, str | None], dict[int, ColorRGBA], dict[int, dict[int, ColorRGBA]]]:
     reader = STEPControl_Reader()
     status = reader.ReadFile(str(step_path))
     if status != IFSelect_RetDone:
@@ -728,10 +836,14 @@ def _load_fallback_occurrence_tree(step_path: Path) -> tuple[list[OccurrenceNode
                 source_name=step_path.stem,
                 transform=_identity_transform_matrix(),
                 prototype_key=prototype_key,
+                local_transform=_identity_transform_matrix(),
                 location=None,
             )
         ],
         {prototype_key: shape},
+        {prototype_key: step_path.stem},
+        {},
+        {},
     )
 
 
@@ -740,11 +852,14 @@ def load_step_scene(step_path: Path) -> LoadedStepScene:
     if not resolved_step_path.exists():
         raise FileNotFoundError(f"STEP file does not exist: {resolved_step_path}")
     load_started = time.perf_counter()
-    roots, prototype_shapes = _load_occurrence_tree(resolved_step_path)
+    roots, prototype_shapes, prototype_names, prototype_colors, prototype_face_colors = _load_occurrence_tree(resolved_step_path)
     return LoadedStepScene(
         step_path=resolved_step_path,
         roots=roots,
         prototype_shapes=prototype_shapes,
+        prototype_names=prototype_names,
+        prototype_colors=prototype_colors,
+        prototype_face_colors=prototype_face_colors,
         load_elapsed=time.perf_counter() - load_started,
     )
 

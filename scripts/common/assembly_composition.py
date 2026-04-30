@@ -7,6 +7,8 @@ from typing import Any, Callable, Mapping, Sequence
 from common.assembly_spec import (
     IDENTITY_TRANSFORM,
     AssemblySpec,
+    AssemblyNodeSpec,
+    assembly_spec_children,
     multiply_transforms,
 )
 from common.render import (
@@ -58,13 +60,16 @@ def build_linked_assembly_composition(
             topology_path=topology_path,
             instance=instance,
             instance_path=(instance.instance_id,),
+            target_occurrence=None,
             parent_world_transform=IDENTITY_TRANSFORM,
+            parent_use_source_colors=True,
+            all_occurrences=occurrences,
             component_occurrences=component_occurrences,
             entries_by_step_path=entries_by_step_path,
             read_assembly_spec=read_assembly_spec,
             stack=(assembly_spec.assembly_path.resolve().as_posix(),),
         )
-        for instance in assembly_spec.instances
+        for instance in assembly_spec_children(assembly_spec)
     ]
     if not children:
         raise AssemblyCompositionError(f"Assembly {cad_ref} has no component instances")
@@ -139,27 +144,180 @@ def _linked_instance_node(
     topology_path: Path,
     instance: object,
     instance_path: tuple[str, ...],
+    target_occurrence: Mapping[str, Any] | None,
     parent_world_transform: tuple[float, ...],
+    parent_use_source_colors: bool,
+    all_occurrences: Sequence[dict[str, Any]],
     component_occurrences: Sequence[dict[str, Any]],
     entries_by_step_path: Mapping[Path, object],
     read_assembly_spec: Callable[[Path], AssemblySpec],
     stack: tuple[str, ...],
 ) -> dict[str, Any]:
-    instance_source_path = Path(getattr(instance, "source_path")).resolve()
-    source_spec = entries_by_step_path.get(instance_source_path)
-    if source_spec is None:
+    instance_source_path = Path(instance.source_path).resolve() if instance.source_path is not None else None
+    source_spec = entries_by_step_path.get(instance_source_path) if instance_source_path is not None else None
+    child_kind = str(getattr(source_spec, "kind", "") or "")
+    instance_transform = tuple(float(value) for value in instance.transform)
+    world_transform = multiply_transforms(parent_world_transform, instance_transform)
+    source_step_path = getattr(source_spec, "step_path", None) if source_spec is not None else None
+    source_path = _relative_to_topology(topology_path, Path(source_step_path)) if source_step_path is not None else (instance.path or "")
+    display_name = str(
+        (
+            Path(source_step_path).stem
+            if source_step_path is not None
+            else Path(instance.path or "").stem
+        )
+        or instance.name
+        or instance_path[-1]
+    ).strip()
+    use_source_colors = parent_use_source_colors and bool(instance.use_source_colors)
+
+    if instance.children:
+        occurrence = target_occurrence or _find_occurrence_by_component_name(
+            component_name(instance_path),
+            all_occurrences,
+            cad_ref,
+        )
+        occurrence_id = str(occurrence.get("id") or component_name(instance_path)).strip() if occurrence else component_name(instance_path)
+        occurrence_world_transform = (
+            tuple(float(value) for value in occurrence.get("transform"))
+            if occurrence and isinstance(occurrence.get("transform"), list) and len(occurrence.get("transform")) == 16
+            else world_transform
+        )
+        target_children_by_parent = _children_by_parent(all_occurrences)
+        target_children = target_children_by_parent.get(occurrence_id, [])
+        children = [
+            _linked_instance_node(
+                cad_ref=cad_ref,
+                topology_path=topology_path,
+                instance=child_instance,
+                instance_path=(*instance_path, child_instance.instance_id),
+                target_occurrence=_match_occurrence_child_for_instance(
+                    target_children,
+                    child_instance,
+                    index,
+                    (*instance_path, child_instance.instance_id),
+                ),
+                parent_world_transform=occurrence_world_transform,
+                parent_use_source_colors=use_source_colors,
+                all_occurrences=all_occurrences,
+                component_occurrences=component_occurrences,
+                entries_by_step_path=entries_by_step_path,
+                read_assembly_spec=read_assembly_spec,
+                stack=stack,
+            )
+            for index, child_instance in enumerate(instance.children)
+        ]
+        return _assembly_node(
+            id=occurrence_id,
+            occurrence_id=occurrence_id,
+            display_name=display_name,
+            source_kind="catalog",
+            source_path=source_path,
+            instance_path=".".join(instance_path),
+            use_source_colors=use_source_colors,
+            local_transform=instance_transform,
+            world_transform=occurrence_world_transform,
+            bbox=(occurrence.get("bbox") if occurrence else None) or _merge_bbox([child.get("bbox") for child in children]),
+            topology_counts=_sum_public_counts(children),
+            children=children,
+        )
+
+    if source_spec is None or instance_source_path is None:
         raise AssemblyCompositionError(
             f"{cad_ref} assembly component {component_name(instance_path)} references missing CAD source {instance.path}"
         )
-    child_kind = str(getattr(source_spec, "kind", "") or "")
-    instance_transform = tuple(float(value) for value in getattr(instance, "transform"))
-    world_transform = multiply_transforms(parent_world_transform, instance_transform)
-    source_step_path = getattr(source_spec, "step_path", None)
-    source_path = _relative_to_topology(topology_path, Path(source_step_path)) if source_step_path is not None else instance.path
-    display_name = str(getattr(instance, "name", "") or instance_path[-1] or Path(instance.path).stem).strip()
+
+    if child_kind == "assembly":
+        stack_key = instance_source_path.as_posix()
+        if stack_key in stack:
+            cycle = " -> ".join((*stack, stack_key))
+            raise AssemblyCompositionError(f"Assembly cycle detected: {cycle}")
+        source_source_path = getattr(source_spec, "source_path", None)
+        script_path = getattr(source_spec, "script_path", None)
+        if source_source_path is None or script_path is None:
+            raise AssemblyCompositionError(
+                f"{cad_ref} nested assembly {instance.path} must be a generated assembly source"
+            )
+        child_spec = read_assembly_spec(Path(source_source_path))
+        occurrence = target_occurrence or _find_occurrence_by_component_name(
+            component_name(instance_path),
+            all_occurrences,
+            cad_ref,
+        )
+        occurrence_id = str(occurrence.get("id") or component_name(instance_path)).strip() if occurrence else component_name(instance_path)
+        occurrence_world_transform = (
+            tuple(float(value) for value in occurrence.get("transform"))
+            if occurrence and isinstance(occurrence.get("transform"), list) and len(occurrence.get("transform")) == 16
+            else world_transform
+        )
+        target_children_by_parent = _children_by_parent(all_occurrences)
+        target_children = target_children_by_parent.get(occurrence_id, [])
+        children = [
+            _linked_instance_node(
+                cad_ref=cad_ref,
+                topology_path=topology_path,
+                instance=child_instance,
+                instance_path=(*instance_path, child_instance.instance_id),
+                target_occurrence=_match_occurrence_child_for_instance(
+                    target_children,
+                    child_instance,
+                    index,
+                    (*instance_path, child_instance.instance_id),
+                ),
+                parent_world_transform=occurrence_world_transform,
+                parent_use_source_colors=use_source_colors,
+                all_occurrences=all_occurrences,
+                component_occurrences=component_occurrences,
+                entries_by_step_path=entries_by_step_path,
+                read_assembly_spec=read_assembly_spec,
+                stack=(*stack, stack_key),
+            )
+            for index, child_instance in enumerate(assembly_spec_children(child_spec))
+        ]
+        return _assembly_node(
+            id=occurrence_id,
+            occurrence_id=occurrence_id,
+            display_name=display_name,
+            source_kind="catalog",
+            source_path=_relative_to_topology(topology_path, Path(source_step_path)) if source_step_path is not None else (instance.path or ""),
+            instance_path=".".join(instance_path),
+            use_source_colors=use_source_colors,
+            local_transform=instance_transform,
+            world_transform=occurrence_world_transform,
+            bbox=(occurrence.get("bbox") if occurrence else None) or _merge_bbox([child.get("bbox") for child in children]),
+            topology_counts=_sum_public_counts(children),
+            children=children,
+        )
+
+    native_source_assembly = _source_assembly_payload(Path(source_step_path)) if source_step_path is not None else None
+    if native_source_assembly is not None:
+        occurrence = target_occurrence or _find_occurrence_by_component_name(
+            component_name(instance_path),
+            all_occurrences,
+            cad_ref,
+        )
+        if occurrence is None:
+            raise AssemblyCompositionError(
+                f"{cad_ref} assembly topology is missing occurrence {component_name(instance_path)!r}"
+            )
+        occurrence_id = str(occurrence.get("id") or "").strip()
+        return _linked_native_assembly_node(
+            topology_path=topology_path,
+            source_topology_path=part_selector_manifest_path(Path(source_step_path)),
+            source_assembly=native_source_assembly,
+            source_path=source_path,
+            occurrence=occurrence,
+            occurrence_id=occurrence_id,
+            all_occurrences=all_occurrences,
+            display_name=display_name,
+            instance_path=".".join(instance_path),
+            use_source_colors=use_source_colors,
+            local_transform=instance_transform,
+            world_transform=tuple(float(value) for value in occurrence.get("transform") or world_transform),
+        )
 
     if child_kind == "part":
-        occurrence = _find_occurrence_by_component_name(
+        occurrence = target_occurrence or _find_occurrence_by_component_name(
             component_name(instance_path),
             component_occurrences,
             cad_ref,
@@ -180,70 +338,416 @@ def _linked_instance_node(
         occurrence_id = str(occurrence.get("id") or "").strip()
         glb_path = part_glb_path(Path(source_step_path))
         glb_hash = sha256_file(glb_path) if glb_path.exists() else ""
-        return {
-            "id": occurrence_id,
-            "occurrenceId": occurrence_id,
-            "nodeType": "part",
-            "displayName": display_name,
-            "sourceKind": "catalog",
-            "sourcePath": source_path,
-            "instancePath": ".".join(instance_path),
-            "localTransform": _transform_list(instance_transform),
-            "worldTransform": _transform_list(tuple(float(value) for value in occurrence.get("transform") or world_transform)),
-            "bbox": occurrence.get("bbox"),
-            "topologyCounts": _public_topology_counts(occurrence_counts),
-            "assets": {
-                "glb": {
-                    "url": _versioned_relative_url(topology_path, glb_path, glb_hash) if glb_hash else "",
-                    "hash": glb_hash,
-                }
-            },
-            "children": [],
-        }
+        return _part_node(
+            id=occurrence_id,
+            occurrence_id=occurrence_id,
+            display_name=display_name,
+            source_kind="catalog",
+            source_path=source_path,
+            instance_path=".".join(instance_path),
+            use_source_colors=use_source_colors,
+            local_transform=instance_transform,
+            world_transform=tuple(float(value) for value in occurrence.get("transform") or world_transform),
+            bbox=occurrence.get("bbox"),
+            topology_counts=_public_topology_counts(occurrence_counts),
+            asset_url=_versioned_relative_url(topology_path, glb_path, glb_hash) if glb_hash else "",
+            asset_hash=glb_hash,
+        )
 
-    if child_kind != "assembly":
-        raise AssemblyCompositionError(
-            f"{cad_ref} component {component_name(instance_path)} must resolve to a STEP part or assembly source"
-        )
-    stack_key = instance_source_path.as_posix()
-    if stack_key in stack:
-        cycle = " -> ".join((*stack, stack_key))
-        raise AssemblyCompositionError(f"Assembly cycle detected: {cycle}")
-    source_path = getattr(source_spec, "source_path", None)
-    script_path = getattr(source_spec, "script_path", None)
-    if source_path is None or script_path is None:
-        raise AssemblyCompositionError(
-            f"{cad_ref} nested assembly {instance.path} must be a generated assembly source"
-        )
-    child_spec = read_assembly_spec(Path(source_path))
-    children = [
-        _linked_instance_node(
-            cad_ref=cad_ref,
+    raise AssemblyCompositionError(
+        f"{cad_ref} component {component_name(instance_path)} must resolve to a STEP part or assembly source"
+    )
+
+
+def _source_assembly_payload(step_path: Path) -> dict[str, Any] | None:
+    topology_path = part_selector_manifest_path(step_path)
+    try:
+        payload = _read_json(topology_path)
+    except AssemblyCompositionError:
+        return None
+    assembly = payload.get("assembly")
+    root = assembly.get("root") if isinstance(assembly, dict) else None
+    if not isinstance(root, dict) or not root.get("children"):
+        return None
+    return assembly
+
+
+def _linked_native_assembly_node(
+    *,
+    topology_path: Path,
+    source_topology_path: Path,
+    source_assembly: Mapping[str, Any],
+    source_path: str,
+    occurrence: Mapping[str, Any],
+    occurrence_id: str,
+    all_occurrences: Sequence[dict[str, Any]],
+    display_name: str,
+    instance_path: str,
+    use_source_colors: bool,
+    local_transform: Sequence[float],
+    world_transform: tuple[float, ...],
+) -> dict[str, Any]:
+    source_root = source_assembly.get("root")
+    if not isinstance(source_root, Mapping):
+        raise AssemblyCompositionError(f"Native source assembly is missing root: {relative_to_repo(source_topology_path)}")
+    source_root_occurrence_id = str(source_root.get("occurrenceId") or source_root.get("id") or "").strip()
+    source_children = source_root.get("children")
+    if not isinstance(source_children, list) or not source_children:
+        raise AssemblyCompositionError(f"Native source assembly has no children: {relative_to_repo(source_topology_path)}")
+    target_children_by_parent = _children_by_parent(all_occurrences)
+    target_children = target_children_by_parent.get(occurrence_id, [])
+    child_nodes = [
+        _clone_native_source_node(
+            source_node=_source_node_for_native_target_child(
+                source_root,
+                source_children,
+                target_children,
+                target_children_by_parent,
+                child,
+                index,
+            ),
+            target_row=child,
+            target_children_by_parent=target_children_by_parent,
             topology_path=topology_path,
-            instance=child_instance,
-            instance_path=(*instance_path, child_instance.instance_id),
+            source_topology_path=source_topology_path,
+            source_root_occurrence_id=source_root_occurrence_id,
+            target_parent_occurrence_id=occurrence_id,
             parent_world_transform=world_transform,
-            component_occurrences=component_occurrences,
-            entries_by_step_path=entries_by_step_path,
-            read_assembly_spec=read_assembly_spec,
-            stack=(*stack, stack_key),
+            parent_instance_path=instance_path,
+            parent_use_source_colors=use_source_colors,
         )
-        for child_instance in child_spec.instances
+        for index, child in enumerate(target_children)
     ]
-    return {
-        "id": component_name(instance_path),
-        "occurrenceId": component_name(instance_path),
-        "nodeType": "assembly",
-        "displayName": display_name,
-        "sourceKind": "catalog",
-        "sourcePath": _relative_to_topology(topology_path, Path(source_step_path)) if source_step_path is not None else instance.path,
-        "instancePath": ".".join(instance_path),
-        "localTransform": _transform_list(instance_transform),
-        "worldTransform": _transform_list(world_transform),
-        "bbox": _merge_bbox([child.get("bbox") for child in children]),
-        "topologyCounts": _sum_public_counts(children),
-        "children": children,
+    if not child_nodes:
+        child_nodes = [
+            _clone_native_source_node(
+                source_node=child,
+                target_row=None,
+                target_children_by_parent={},
+                topology_path=topology_path,
+                source_topology_path=source_topology_path,
+                source_root_occurrence_id=source_root_occurrence_id,
+                target_parent_occurrence_id=occurrence_id,
+                parent_world_transform=world_transform,
+                parent_instance_path=instance_path,
+                parent_use_source_colors=use_source_colors,
+            )
+            for child in source_children
+            if isinstance(child, Mapping)
+        ]
+    child_counts = _sum_public_counts(child_nodes)
+    return _assembly_node(
+        id=occurrence_id,
+        occurrence_id=occurrence_id,
+        display_name=display_name,
+        source_kind="native",
+        source_path=source_path,
+        instance_path=instance_path,
+        use_source_colors=use_source_colors,
+        local_transform=local_transform,
+        world_transform=world_transform,
+        bbox=occurrence.get("bbox") or _merge_bbox([child.get("bbox") for child in child_nodes]),
+        topology_counts=child_counts if _counts_have_values(child_counts) else _public_topology_counts(_occurrence_topology_counts(occurrence)),
+        children=child_nodes,
+    )
+
+
+def _clone_native_source_node(
+    *,
+    source_node: Mapping[str, Any],
+    target_row: Mapping[str, Any] | None,
+    target_children_by_parent: Mapping[str, list[dict[str, Any]]],
+    topology_path: Path,
+    source_topology_path: Path,
+    source_root_occurrence_id: str,
+    target_parent_occurrence_id: str,
+    parent_world_transform: tuple[float, ...],
+    parent_instance_path: str,
+    parent_use_source_colors: bool,
+) -> dict[str, Any]:
+    source_occurrence_id = str(source_node.get("occurrenceId") or source_node.get("id") or "").strip()
+    occurrence_id = (
+        str(target_row.get("id") or "").strip()
+        if target_row is not None
+        else _prefix_native_occurrence_id(
+            source_occurrence_id,
+            source_root_occurrence_id=source_root_occurrence_id,
+            target_parent_occurrence_id=target_parent_occurrence_id,
+        )
+    )
+    source_world_transform = _transform_tuple(source_node.get("worldTransform"), IDENTITY_TRANSFORM)
+    source_local_transform = _transform_tuple(source_node.get("localTransform"), source_world_transform)
+    world_transform = _row_transform(target_row) if target_row is not None else multiply_transforms(parent_world_transform, source_local_transform)
+    local_transform = (
+        _relative_transform(parent_world_transform, world_transform)
+        if target_row is not None
+        else source_local_transform
+    )
+    source_children = source_node.get("children")
+    target_children = target_children_by_parent.get(occurrence_id, []) if occurrence_id else []
+    if target_children and not _source_node_has_children(source_node) and _source_node_has_glb_asset(source_node):
+        return _native_source_part_node(
+            source_node=source_node,
+            target_row=target_row,
+            topology_path=topology_path,
+            source_topology_path=source_topology_path,
+            occurrence_id=occurrence_id,
+            display_name=_occurrence_display_name(target_row) if target_row is not None else "",
+            instance_path=".".join(
+                part
+                for part in (
+                    parent_instance_path,
+                    str(target_row.get("path") or "") if target_row is not None else str(source_node.get("instancePath") or source_occurrence_id),
+                )
+                if part
+            ),
+            use_source_colors=parent_use_source_colors and source_node.get("useSourceColors") is not False,
+            local_transform=local_transform,
+            world_transform=world_transform,
+            bbox=target_row.get("bbox") if target_row is not None else _transform_bbox(parent_world_transform, source_node.get("bbox")),
+        )
+    node_children = [
+        _clone_native_source_node(
+            source_node=_match_source_child_for_target(source_children, child, index),
+            target_row=child,
+            target_children_by_parent=target_children_by_parent,
+            topology_path=topology_path,
+            source_topology_path=source_topology_path,
+            source_root_occurrence_id=source_root_occurrence_id,
+            target_parent_occurrence_id=target_parent_occurrence_id,
+            parent_world_transform=world_transform,
+            parent_instance_path=parent_instance_path,
+            parent_use_source_colors=parent_use_source_colors,
+        )
+        for index, child in enumerate(target_children)
+    ]
+    if not node_children and isinstance(source_children, list) and source_children:
+        node_children = [
+            _clone_native_source_node(
+                source_node=child,
+                target_row=None,
+                target_children_by_parent={},
+                topology_path=topology_path,
+                source_topology_path=source_topology_path,
+                source_root_occurrence_id=source_root_occurrence_id,
+                target_parent_occurrence_id=occurrence_id,
+                parent_world_transform=world_transform,
+                parent_instance_path=parent_instance_path,
+                parent_use_source_colors=parent_use_source_colors,
+            )
+            for child in source_children
+            if isinstance(child, Mapping)
+        ]
+    display_name = str(
+        _occurrence_display_name(target_row)
+        if target_row is not None
+        else source_node.get("displayName") or source_node.get("name") or occurrence_id
+    ).strip()
+    instance_path = ".".join(
+        part
+        for part in (
+            parent_instance_path,
+            str(target_row.get("path") or "") if target_row is not None else str(source_node.get("instancePath") or source_occurrence_id),
+        )
+        if part
+    )
+    topology_counts = source_node.get("topologyCounts") if isinstance(source_node.get("topologyCounts"), Mapping) else {}
+    bbox = target_row.get("bbox") if target_row is not None else _transform_bbox(parent_world_transform, source_node.get("bbox"))
+    use_source_colors = parent_use_source_colors and source_node.get("useSourceColors") is not False
+    if node_children:
+        child_counts = _sum_public_counts(node_children)
+        return _assembly_node(
+            id=occurrence_id,
+            occurrence_id=occurrence_id,
+            display_name=display_name,
+            source_kind="native",
+            source_path="",
+            instance_path=instance_path,
+            use_source_colors=use_source_colors,
+            local_transform=local_transform,
+            world_transform=world_transform,
+            bbox=bbox or _merge_bbox([child.get("bbox") for child in node_children]),
+            topology_counts=child_counts if _counts_have_values(child_counts) else _public_topology_counts(topology_counts),
+            children=node_children,
+        )
+
+    return _native_source_part_node(
+        source_node=source_node,
+        target_row=target_row,
+        topology_path=topology_path,
+        source_topology_path=source_topology_path,
+        occurrence_id=occurrence_id,
+        display_name=display_name,
+        instance_path=instance_path,
+        use_source_colors=use_source_colors,
+        local_transform=local_transform,
+        world_transform=world_transform,
+        bbox=bbox,
+    )
+
+
+def _source_node_has_children(source_node: Mapping[str, Any]) -> bool:
+    source_children = source_node.get("children")
+    return isinstance(source_children, list) and bool(source_children)
+
+
+def _source_node_glb_asset(source_node: Mapping[str, Any]) -> Mapping[str, Any]:
+    glb_asset = source_node.get("assets", {}).get("glb") if isinstance(source_node.get("assets"), Mapping) else {}
+    return glb_asset if isinstance(glb_asset, Mapping) else {}
+
+
+def _source_node_has_glb_asset(source_node: Mapping[str, Any]) -> bool:
+    return bool(str(_source_node_glb_asset(source_node).get("url") or "").strip())
+
+
+def _native_source_part_node(
+    *,
+    source_node: Mapping[str, Any],
+    target_row: Mapping[str, Any] | None,
+    topology_path: Path,
+    source_topology_path: Path,
+    occurrence_id: str,
+    display_name: str,
+    instance_path: str,
+    use_source_colors: bool,
+    local_transform: Sequence[float],
+    world_transform: Sequence[float],
+    bbox: Any,
+) -> dict[str, Any]:
+    glb_asset = _source_node_glb_asset(source_node)
+    asset_hash = str(glb_asset.get("hash") or "").strip() if isinstance(glb_asset, Mapping) else ""
+    asset_url = _relocated_asset_url(topology_path, source_topology_path, str(glb_asset.get("url") or "")) if isinstance(glb_asset, Mapping) else ""
+    topology_counts = (
+        _occurrence_topology_counts(target_row)
+        if target_row is not None
+        else source_node.get("topologyCounts") if isinstance(source_node.get("topologyCounts"), Mapping) else {}
+    )
+    return _part_node(
+        id=occurrence_id,
+        occurrence_id=occurrence_id,
+        display_name=display_name,
+        source_kind="native",
+        source_path="",
+        instance_path=instance_path,
+        use_source_colors=use_source_colors,
+        local_transform=local_transform,
+        world_transform=world_transform,
+        bbox=bbox,
+        topology_counts=_public_topology_counts(topology_counts),
+        asset_url=asset_url,
+        asset_hash=asset_hash,
+    )
+
+
+def _prefix_native_occurrence_id(
+    source_occurrence_id: str,
+    *,
+    source_root_occurrence_id: str,
+    target_parent_occurrence_id: str,
+) -> str:
+    if source_root_occurrence_id and source_occurrence_id == source_root_occurrence_id:
+        return target_parent_occurrence_id
+    prefix = f"{source_root_occurrence_id}."
+    if source_root_occurrence_id and source_occurrence_id.startswith(prefix):
+        return f"{target_parent_occurrence_id}.{source_occurrence_id[len(prefix):]}"
+    suffix = source_occurrence_id[1:] if source_occurrence_id.startswith("o") else source_occurrence_id
+    return f"{target_parent_occurrence_id}.{suffix}" if suffix else target_parent_occurrence_id
+
+
+def _relocated_asset_url(topology_path: Path, source_topology_path: Path, raw_url: str) -> str:
+    if not raw_url:
+        return ""
+    asset_path, separator, query = raw_url.partition("?")
+    if not asset_path:
+        return ""
+    target_path = (source_topology_path.parent / asset_path).resolve()
+    relocated = _relative_to_topology(topology_path, target_path)
+    return f"{relocated}{separator}{query}" if separator else relocated
+
+
+def _children_by_parent(occurrences: Sequence[dict[str, Any]]) -> dict[str, list[dict[str, Any]]]:
+    children_by_parent: dict[str, list[dict[str, Any]]] = {}
+    for row in occurrences:
+        parent_id = str(row.get("parentId") or "").strip()
+        if parent_id:
+            children_by_parent.setdefault(parent_id, []).append(row)
+    return children_by_parent
+
+
+def _match_source_child_for_target(
+    source_children: object,
+    target_row: Mapping[str, Any],
+    index: int,
+) -> Mapping[str, Any]:
+    candidates = [child for child in source_children if isinstance(child, Mapping)] if isinstance(source_children, list) else []
+    if not candidates:
+        return {}
+    target_names = {
+        str(target_row.get("name") or "").strip(),
+        str(target_row.get("sourceName") or "").strip(),
+        str(target_row.get("id") or "").strip(),
     }
+    target_names.discard("")
+    for candidate in candidates:
+        candidate_names = {
+            str(candidate.get("displayName") or "").strip(),
+            str(candidate.get("name") or "").strip(),
+            str(candidate.get("occurrenceId") or "").strip(),
+            str(candidate.get("id") or "").strip(),
+        }
+        if target_names.intersection(candidate_names):
+            return candidate
+    if 0 <= index < len(candidates):
+        return candidates[index]
+    return candidates[-1]
+
+
+def _source_node_for_native_target_child(
+    source_root: Mapping[str, Any],
+    source_children: object,
+    target_siblings: Sequence[Mapping[str, Any]],
+    target_children_by_parent: Mapping[str, list[dict[str, Any]]],
+    target_row: Mapping[str, Any],
+    index: int,
+) -> Mapping[str, Any]:
+    target_row_id = str(target_row.get("id") or "").strip()
+    target_child_rows = target_children_by_parent.get(target_row_id, []) if target_row_id else []
+    source_child_count = len(source_children) if isinstance(source_children, list) else 0
+    if (
+        len(target_siblings) == 1
+        and len(target_child_rows) > 1
+        and source_child_count > 1
+        and isinstance(source_root, Mapping)
+    ):
+        return source_root
+    return _match_source_child_for_target(source_children, target_row, index)
+
+
+def _match_occurrence_child_for_instance(
+    target_children: Sequence[Mapping[str, Any]],
+    instance: object,
+    index: int,
+    instance_path: tuple[str, ...],
+) -> Mapping[str, Any] | None:
+    if not target_children:
+        return None
+    expected_names = {
+        str(getattr(instance, "instance_id", "") or "").strip(),
+        str(getattr(instance, "name", "") or "").strip(),
+        component_name(instance_path),
+    }
+    expected_names.discard("")
+    for child in target_children:
+        child_names = {
+            str(child.get("name") or "").strip(),
+            str(child.get("sourceName") or "").strip(),
+            str(child.get("id") or "").strip(),
+        }
+        if expected_names.intersection(child_names):
+            return child
+    if 0 <= index < len(target_children):
+        return target_children[index]
+    return target_children[-1]
 
 
 def _native_occurrence_node(
@@ -274,19 +778,20 @@ def _native_occurrence_node(
         )
         for child in children
     ]
-    return {
-        "id": row_id,
-        "occurrenceId": row_id,
-        "nodeType": "assembly",
-        "displayName": _occurrence_display_name(row),
-        "sourceKind": "native",
-        "instancePath": str(row.get("path") or row_id),
-        "localTransform": _transform_list(_relative_transform(parent_world_transform, world_transform)),
-        "worldTransform": _transform_list(world_transform),
-        "bbox": row.get("bbox") or _merge_bbox([child.get("bbox") for child in child_nodes]),
-        "topologyCounts": _public_topology_counts(_occurrence_topology_counts(row)),
-        "children": child_nodes,
-    }
+    return _assembly_node(
+        id=row_id,
+        occurrence_id=row_id,
+        display_name=_occurrence_display_name(row),
+        source_kind="native",
+        source_path="",
+        instance_path=str(row.get("path") or row_id),
+        use_source_colors=True,
+        local_transform=_relative_transform(parent_world_transform, world_transform),
+        world_transform=world_transform,
+        bbox=row.get("bbox") or _merge_bbox([child.get("bbox") for child in child_nodes]),
+        topology_counts=_public_topology_counts(_occurrence_topology_counts(row)),
+        children=child_nodes,
+    )
 
 
 def _native_part_node(
@@ -304,42 +809,128 @@ def _native_part_node(
         raise AssemblyCompositionError(f"Native assembly component {occurrence_id} is missing a mesh asset")
     mesh_hash = sha256_file(mesh_path) if mesh_path.exists() else ""
     world_transform = _row_transform(row)
+    return _part_node(
+        id=occurrence_id,
+        occurrence_id=occurrence_id,
+        display_name=_occurrence_display_name(row),
+        source_kind="native",
+        source_path="",
+        instance_path=str(row.get("path") or occurrence_id),
+        use_source_colors=True,
+        local_transform=_relative_transform(parent_world_transform, world_transform),
+        world_transform=world_transform,
+        bbox=row.get("bbox"),
+        topology_counts=_public_topology_counts(_occurrence_topology_counts(row)),
+        asset_url=_versioned_relative_url(topology_path, mesh_path, mesh_hash) if mesh_hash else "",
+        asset_hash=mesh_hash,
+    )
+
+
+def _part_node(
+    *,
+    id: str,
+    occurrence_id: str,
+    display_name: str,
+    source_kind: str,
+    source_path: str,
+    instance_path: str,
+    use_source_colors: bool,
+    local_transform: Sequence[float],
+    world_transform: Sequence[float],
+    bbox: Any,
+    topology_counts: Mapping[str, int],
+    asset_url: str,
+    asset_hash: str,
+) -> dict[str, Any]:
     return {
-        "id": occurrence_id,
+        "id": id,
         "occurrenceId": occurrence_id,
         "nodeType": "part",
-        "displayName": _occurrence_display_name(row),
-        "sourceKind": "native",
-        "instancePath": str(row.get("path") or occurrence_id),
-        "localTransform": _transform_list(_relative_transform(parent_world_transform, world_transform)),
+        "displayName": display_name,
+        "sourceKind": source_kind,
+        "sourcePath": source_path,
+        "instancePath": instance_path,
+        "useSourceColors": use_source_colors,
+        "localTransform": _transform_list(local_transform),
         "worldTransform": _transform_list(world_transform),
-        "bbox": row.get("bbox"),
-        "topologyCounts": _public_topology_counts(_occurrence_topology_counts(row)),
+        "bbox": bbox,
+        "topologyCounts": _public_topology_counts(topology_counts),
         "assets": {
             "glb": {
-                "url": _versioned_relative_url(topology_path, mesh_path, mesh_hash) if mesh_hash else "",
-                "hash": mesh_hash,
+                "url": asset_url,
+                "hash": asset_hash,
             }
         },
+        "leafPartIds": [id],
         "children": [],
     }
 
 
-def _assembly_root_node(cad_ref: str, root_occurrence: dict[str, Any], children: Sequence[dict[str, Any]]) -> dict[str, Any]:
-    counts = _sum_public_counts(children) or _public_topology_counts(_occurrence_topology_counts(root_occurrence))
+def _assembly_node(
+    *,
+    id: str,
+    occurrence_id: str,
+    display_name: str,
+    source_kind: str,
+    source_path: str,
+    instance_path: str,
+    use_source_colors: bool,
+    local_transform: Sequence[float],
+    world_transform: Sequence[float],
+    bbox: Any,
+    topology_counts: Mapping[str, int],
+    children: Sequence[dict[str, Any]],
+) -> dict[str, Any]:
+    leaf_part_ids = _leaf_part_ids(children)
     return {
-        "id": "root",
-        "occurrenceId": str(root_occurrence.get("id") or "root").strip() or "root",
+        "id": id,
+        "occurrenceId": occurrence_id,
         "nodeType": "assembly",
-        "displayName": _root_display_name(cad_ref, root_occurrence),
-        "sourceKind": "catalog",
-        "instancePath": "",
-        "localTransform": _transform_list(IDENTITY_TRANSFORM),
-        "worldTransform": _transform_list(IDENTITY_TRANSFORM),
-        "bbox": root_occurrence.get("bbox") or _merge_bbox([child.get("bbox") for child in children]),
-        "topologyCounts": counts,
+        "displayName": display_name,
+        "sourceKind": source_kind,
+        "sourcePath": source_path,
+        "instancePath": instance_path,
+        "useSourceColors": use_source_colors,
+        "localTransform": _transform_list(local_transform),
+        "worldTransform": _transform_list(world_transform),
+        "bbox": bbox,
+        "topologyCounts": _public_topology_counts(topology_counts),
+        "leafPartIds": leaf_part_ids,
         "children": list(children),
     }
+
+
+def _leaf_part_ids(children: Sequence[Mapping[str, Any]]) -> list[str]:
+    ids: list[str] = []
+    for child in children:
+        child_ids = child.get("leafPartIds")
+        if isinstance(child_ids, list):
+            ids.extend(str(value) for value in child_ids if str(value or "").strip())
+            continue
+        child_id = str(child.get("id") or "").strip()
+        if child_id:
+            ids.append(child_id)
+    return ids
+
+
+def _assembly_root_node(cad_ref: str, root_occurrence: dict[str, Any], children: Sequence[dict[str, Any]]) -> dict[str, Any]:
+    counts = _sum_public_counts(children)
+    if not _counts_have_values(counts):
+        counts = _public_topology_counts(_occurrence_topology_counts(root_occurrence))
+    return _assembly_node(
+        id="root",
+        occurrence_id=str(root_occurrence.get("id") or "root").strip() or "root",
+        display_name=_root_display_name(cad_ref, root_occurrence),
+        source_kind="catalog",
+        source_path="",
+        instance_path="",
+        use_source_colors=True,
+        local_transform=IDENTITY_TRANSFORM,
+        world_transform=IDENTITY_TRANSFORM,
+        bbox=root_occurrence.get("bbox") or _merge_bbox([child.get("bbox") for child in children]),
+        topology_counts=counts,
+        children=children,
+    )
 
 
 def _root_display_name(cad_ref: str, root_occurrence: Mapping[str, Any]) -> str:
@@ -473,8 +1064,16 @@ def _sum_public_counts(children: Sequence[Mapping[str, Any]]) -> dict[str, int]:
     return total
 
 
+def _counts_have_values(counts: Mapping[str, int]) -> bool:
+    return any(int(counts.get(key) or 0) > 0 for key in ("shapes", "faces", "edges", "vertices"))
+
+
 def _occurrence_display_name(row: Mapping[str, Any]) -> str:
-    return str(row.get("name") or row.get("sourceName") or row.get("path") or row.get("id") or "component").strip()
+    name = str(row.get("name") or "").strip()
+    source_name = str(row.get("sourceName") or "").strip()
+    if name and not (name.startswith("=>[") and name.endswith("]")):
+        return name
+    return source_name or name or str(row.get("path") or row.get("id") or "component").strip()
 
 
 def _row_transform(row: Mapping[str, Any]) -> tuple[float, ...]:
@@ -484,8 +1083,47 @@ def _row_transform(row: Mapping[str, Any]) -> tuple[float, ...]:
     return tuple(float(value) for value in raw_transform)
 
 
+def _transform_tuple(raw_transform: Any, fallback: Sequence[float]) -> tuple[float, ...]:
+    if not isinstance(raw_transform, list) or len(raw_transform) != 16:
+        return tuple(float(value) for value in fallback)
+    return tuple(float(value) for value in raw_transform)
+
+
 def _transform_list(transform: Sequence[float]) -> list[float]:
     return [float(value) for value in transform]
+
+
+def _transform_point(transform: Sequence[float], point: Sequence[float]) -> list[float]:
+    x = float(point[0])
+    y = float(point[1])
+    z = float(point[2])
+    return [
+        (float(transform[0]) * x) + (float(transform[1]) * y) + (float(transform[2]) * z) + float(transform[3]),
+        (float(transform[4]) * x) + (float(transform[5]) * y) + (float(transform[6]) * z) + float(transform[7]),
+        (float(transform[8]) * x) + (float(transform[9]) * y) + (float(transform[10]) * z) + float(transform[11]),
+    ]
+
+
+def _transform_bbox(transform: Sequence[float], bbox: Any) -> dict[str, Any] | None:
+    if not isinstance(bbox, Mapping) or not isinstance(bbox.get("min"), list) or not isinstance(bbox.get("max"), list):
+        return None
+    mins = bbox["min"]
+    maxs = bbox["max"]
+    corners = [
+        [mins[0], mins[1], mins[2]],
+        [mins[0], mins[1], maxs[2]],
+        [mins[0], maxs[1], mins[2]],
+        [mins[0], maxs[1], maxs[2]],
+        [maxs[0], mins[1], mins[2]],
+        [maxs[0], mins[1], maxs[2]],
+        [maxs[0], maxs[1], mins[2]],
+        [maxs[0], maxs[1], maxs[2]],
+    ]
+    transformed = [_transform_point(transform, corner) for corner in corners]
+    return {
+        "min": [min(point[index] for point in transformed) for index in range(3)],
+        "max": [max(point[index] for point in transformed) for index in range(3)],
+    }
 
 
 def _merge_bbox(boxes: Sequence[Any]) -> dict[str, Any]:

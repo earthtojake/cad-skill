@@ -1,46 +1,46 @@
 # CAD Ref Tool
 
-`scripts/cadref` resolves prompt-ready `@cad[...]` refs directly from STEP entries.
+`scripts/cadref/cli.py` resolves prompt-ready `@cad[...]` refs directly from STEP entries.
 
 Run commands from the project or workspace directory that makes your target paths resolve.
 
 ## Canonical Command
 
 ```bash
-python <cad-skill>/scripts/cadref --help
+python <cad-skill>/scripts/cadref/cli.py --help
 ```
 
 ## Command Surface
 
 ```bash
-python <cad-skill>/scripts/cadref inspect '<text containing @cad[...] refs>' --json
+python <cad-skill>/scripts/cadref/cli.py inspect '<text containing @cad[...] refs>' --json
 
-python <cad-skill>/scripts/cadref planes models/path/to/entry --json
+python <cad-skill>/scripts/cadref/cli.py planes path/to/entry --json
 
-python <cad-skill>/scripts/cadref diff models/path/to/before models/path/to/after --json
+python <cad-skill>/scripts/cadref/cli.py diff path/to/before path/to/after --json
 ```
 
 Whole-entry refs default to a cheap summary so large STEP files do not dump every
 selector list. Use `--topology` only when you explicitly need full selector lists:
 
 ```bash
-python <cad-skill>/scripts/cadref inspect '@cad[models/path/to/entry]' --json
+python <cad-skill>/scripts/cadref/cli.py inspect '@cad[path/to/entry]' --json
 
-python <cad-skill>/scripts/cadref inspect '@cad[models/path/to/entry#f10]' --detail --facts --json
+python <cad-skill>/scripts/cadref/cli.py inspect '@cad[path/to/entry#f10]' --detail --facts --json
 
-python <cad-skill>/scripts/cadref inspect --refs '@cad[models/path/to/assembly#o1.1.1.f10]' '@cad[models/path/to/assembly#o1.1.1.e20]' --detail --facts --json
+python <cad-skill>/scripts/cadref/cli.py inspect --refs '@cad[path/to/assembly#o1.1.1.f10]' '@cad[path/to/assembly#o1.1.1.e20]' --detail --facts --json
 
-python <cad-skill>/scripts/cadref planes '@cad[models/path/to/entry]' --json
+python <cad-skill>/scripts/cadref/cli.py planes '@cad[path/to/entry]' --json
 
-python <cad-skill>/scripts/cadref diff models/path/to/before models/path/to/after --json
+python <cad-skill>/scripts/cadref/cli.py diff path/to/before path/to/after --json
 ```
 
 You can also read text from a file or stdin:
 
 ```bash
-python <cad-skill>/scripts/cadref inspect --input-file /tmp/prompt.txt --json
+python <cad-skill>/scripts/cadref/cli.py inspect --input-file /tmp/prompt.txt --json
 
-cat /tmp/prompt.txt | python <cad-skill>/scripts/cadref inspect --json
+cat /tmp/prompt.txt | python <cad-skill>/scripts/cadref/cli.py inspect --json
 ```
 
 ## Ref Rules
@@ -80,6 +80,6 @@ If a selector no longer resolves against the current STEP topology, `inspect` re
 
 ## Source Of Truth
 
-- `scripts/cadref` resolves STEP refs from STEP files and generated selector artifacts.
+- `scripts/cadref/cli.py` resolves STEP refs from STEP files and generated selector artifacts.
 - Assembly refs resolve from generated assembly STEP files, not from reconstructed Python instance summaries.
-- It does not read package-local viewer runtime assets to interpret refs.
+- It does not read package-local explorer runtime assets to interpret refs.

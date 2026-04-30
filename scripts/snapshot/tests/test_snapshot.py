@@ -13,9 +13,6 @@ from common.render import part_glb_path
 from tests.cad_test_roots import IsolatedCadRoots
 
 
-IDENTITY_TRANSFORM = [1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1]
-
-
 def _read_png_rgb(path: Path) -> np.ndarray:
     data = path.read_bytes()
     if data[:8] != b"\x89PNG\r\n\x1a\n":
@@ -62,28 +59,12 @@ class SnapshotTests(unittest.TestCase):
         shutil.rmtree(self.temp_root, ignore_errors=True)
         self._tempdir.cleanup()
 
-    def _local_step_ref(self, name: str) -> str:
-        return f"{name}.step"
-
     def _write_part(self, name: str) -> Path:
         step_path = self.temp_root / f"{name}.step"
         step_path.write_text("ISO-10303-21; END-ISO-10303-21;\n")
         glb_path = part_glb_path(step_path)
         self.render_paths.append(glb_path)
         return self._write_triangle_glb(glb_path)
-
-    def _write_assembly_generator(self, name: str, *, instances: list[dict[str, object]]) -> Path:
-        assembly_path = self.temp_root / f"{name}.py"
-        assembly_path.write_text(
-            "\n".join(
-                [
-                    "def gen_step():",
-                    f"    return {{'instances': {instances!r}, 'step_output': {f'{name}.step'!r}}}",
-                    "",
-                ]
-            )
-        )
-        return assembly_path
 
     def _write_triangle_stl(self, path: Path) -> Path:
         path.write_text(
@@ -129,6 +110,55 @@ class SnapshotTests(unittest.TestCase):
         mesh.export(path)
         return path
 
+    def _write_build123d_style_glb(self, path: Path) -> tuple[np.ndarray, np.ndarray]:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        vertices = np.asarray(
+            [
+                [0.0, 0.0, 0.0],
+                [0.010, 0.0, 0.0],
+                [0.0, 0.005, 0.002],
+                [0.010, 0.005, 0.002],
+            ],
+            dtype=float,
+        )
+        mesh = trimesh.Trimesh(
+            vertices=vertices,
+            faces=np.asarray([[0, 1, 2], [1, 3, 2]], dtype=np.int64),
+            process=False,
+        )
+        scene = trimesh.Scene()
+        root_correction = np.asarray(
+            [
+                [1.0, 0.0, 0.0, 0.0],
+                [0.0, 0.0, 1.0, 0.0],
+                [0.0, -1.0, 0.0, 0.0],
+                [0.0, 0.0, 0.0, 1.0],
+            ],
+            dtype=float,
+        )
+        scene.graph.update(frame_to="cad_root", frame_from="world", matrix=root_correction)
+        angle = np.pi / 2.0
+        cad_transform = np.asarray(
+            [
+                [np.cos(angle), -np.sin(angle), 0.0, 0.020],
+                [np.sin(angle), np.cos(angle), 0.0, 0.040],
+                [0.0, 0.0, 1.0, 0.003],
+                [0.0, 0.0, 0.0, 1.0],
+            ],
+            dtype=float,
+        )
+        scene.add_geometry(
+            mesh,
+            parent_node_name="cad_root",
+            node_name="moved_part",
+            geom_name="moved_part",
+            transform=cad_transform,
+        )
+        scene.export(path)
+        expected = np.column_stack((vertices, np.ones(vertices.shape[0], dtype=float))) @ cad_transform.T
+        expected_mm = expected[:, :3] * 1000.0
+        return expected_mm.min(axis=0), expected_mm.max(axis=0)
+
     def test_snapshot_renders_single_glb(self) -> None:
         glb_path = self._write_part("part")
         png_path = self.temp_root / "part.png"
@@ -154,6 +184,15 @@ class SnapshotTests(unittest.TestCase):
         background = pixels[0, 0]
         non_background = np.any(pixels != background, axis=2)
         self.assertGreater(float(non_background.mean()), 0.18)
+
+    def test_snapshot_converts_build123d_glb_root_correction_to_cad_frame(self) -> None:
+        glb_path = self.temp_root / "assembly.glb"
+        expected_min, expected_max = self._write_build123d_style_glb(glb_path)
+
+        instance = snapshot_cli._read_glb_mesh(glb_path)
+
+        np.testing.assert_allclose(instance.vertices.min(axis=0), expected_min, atol=1e-5)
+        np.testing.assert_allclose(instance.vertices.max(axis=0), expected_max, atol=1e-5)
 
     def test_snapshot_renders_single_stl(self) -> None:
         stl_path = self._write_triangle_stl(self.temp_root / "mesh.stl")
@@ -223,60 +262,12 @@ class SnapshotTests(unittest.TestCase):
         pixels = _read_png_rgb(png_path)
         self.assertGreater(len(np.unique(pixels.reshape(-1, 3), axis=0)), 1)
 
-    def test_snapshot_renders_python_assembly_generator(self) -> None:
-        part_path = self._write_part("part")
-        assembly_path = self._write_assembly_generator(
-            "assembly",
-            instances=[
-                {
-                    "path": self._local_step_ref("part"),
-                    "name": "left",
-                    "transform": [1, 0, 0, -12, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1],
-                },
-                {
-                    "path": self._local_step_ref("part"),
-                    "name": "right",
-                    "transform": [1, 0, 0, 12, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1],
-                },
-            ],
-        )
-        png_path = self.temp_root / "assembly.png"
+    def test_snapshot_rejects_python_assembly_input(self) -> None:
+        assembly_path = self.temp_root / "assembly.py"
+        assembly_path.write_text("def gen_step():\n    return {'step_output': 'assembly.step', 'children': []}\n")
 
-        snapshot_cli.main(
-            [
-                str(assembly_path),
-                "--out",
-                str(png_path),
-                "--width",
-                "260",
-                "--height",
-                "180",
-                "--no-axes",
-            ]
-        )
-
-        self.assertTrue(part_path.exists())
-        pixels = _read_png_rgb(png_path)
-        self.assertLessEqual(pixels.shape[0], 180)
-        self.assertLessEqual(pixels.shape[1], 260)
-        self.assertGreater(len(np.unique(pixels.reshape(-1, 3), axis=0)), 1)
-
-    def test_snapshot_rejects_invalid_python_assembly_schema(self) -> None:
-        part_path = self._write_part("shared")
-        root_assembly = self._write_assembly_generator(
-            "broken",
-            instances=[
-                {
-                    "path": self._local_step_ref("shared"),
-                    "name": "bad name",
-                    "transform": IDENTITY_TRANSFORM,
-                }
-            ],
-        )
-
-        self.assertTrue(part_path.exists())
-        with self.assertRaisesRegex(ValueError, "letters, numbers"):
-            snapshot_cli.load_mesh_instances(root_assembly)
+        with self.assertRaisesRegex(ValueError, "generated assembly GLB instead"):
+            snapshot_cli.load_mesh_instances(assembly_path)
 
     def test_snapshot_accepts_explicit_inputs_outside_cwd(self) -> None:
         tempdir = tempfile.TemporaryDirectory(prefix="tmp-snapshot-outside-")

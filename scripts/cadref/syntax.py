@@ -60,14 +60,10 @@ def normalize_cad_path(raw_cad_path: str) -> str | None:
     normalized = str(raw_cad_path or "").replace("\\", "/").strip().strip("/")
     if not normalized:
         return None
-    if normalized.startswith("cad/"):
-        normalized = f"models/{normalized[len('cad/') :]}"
     for suffix in (".step", ".stp"):
         if normalized.lower().endswith(suffix):
             normalized = normalized[: -len(suffix)]
             break
-    if not normalized.startswith("models/"):
-        normalized = f"models/{normalized}"
     parts = normalized.split("/")
     if any(not part or part in {".", ".."} for part in parts):
         return None

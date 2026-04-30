@@ -12,7 +12,7 @@ class GenStepAssemblyCliTests(unittest.TestCase):
 
     def test_rejects_root_option(self) -> None:
         with self.assertRaises(SystemExit) as cm:
-            cli.main(["--root", "models/samples"])
+            cli.main(["--root", "workspace/samples"])
         self.assertEqual(2, cm.exception.code)
 
     def test_passes_targets_in_order(self) -> None:
@@ -31,6 +31,13 @@ class GenStepAssemblyCliTests(unittest.TestCase):
                 cli.main(
                     [
                         "imports/sample_assembly.step",
+                        "--export-3mf",
+                        "--3mf-output",
+                        "../meshes/sample_assembly.3mf",
+                        "--3mf-tolerance",
+                        "1.2",
+                        "--3mf-angular-tolerance",
+                        "0.6",
                         "--glb-tolerance",
                         "1.0",
                         "--glb-angular-tolerance",
@@ -45,6 +52,10 @@ class GenStepAssemblyCliTests(unittest.TestCase):
         self.assertEqual(["imports/sample_assembly.step"], generate.call_args.args[0])
         self.assertFalse(generate.call_args.kwargs["summary"])
         options = generate.call_args.kwargs["step_options"]
+        self.assertTrue(options.export_3mf)
+        self.assertEqual("../meshes/sample_assembly.3mf", options.three_mf_output)
+        self.assertEqual(1.2, options.three_mf_tolerance)
+        self.assertEqual(0.6, options.three_mf_angular_tolerance)
         self.assertEqual(1.0, options.glb_tolerance)
         self.assertEqual(0.55, options.glb_angular_tolerance)
         self.assertEqual((0x11 / 255.0, 0x22 / 255.0, 0x33 / 255.0, 0x44 / 255.0), options.color)

@@ -23,17 +23,17 @@ Treat them as complementary. Annotated images provide intent, orientation, and r
 
 Supported selectors are `o<path>`, `o<path>.s<n>`, `o<path>.f<n>`, `o<path>.e<n>`, `o<path>.v<n>`, plus compact single-occurrence aliases `s<n>`, `f<n>`, `e<n>`, and `v<n>`.
 
-`<cad-path>` is a path without the `.step` or `.stp` suffix. In this harness, copied refs include the `models/` directory, for example `@cad[models/path/to/example]`.
+`<cad-path>` is a path without the `.step` or `.stp` suffix, relative to the active CAD workspace root, for example `@cad[path/to/example]`.
 
 ## Resolution Workflow
 
-- Resolve refs with `scripts/cadref inspect`.
+- Resolve refs with `scripts/cadref/cli.py inspect`.
 - For complex edits, resolve selected face/edge/corner refs into geometry facts before editing with `--detail --facts`.
 - Treat topology ordinals as handles, not semantic feature definitions.
 - Use `cadref planes <cad-path or @cad[...]> --json` to find major coplanar plane groups instead of inferring plate or wall faces from screenshots.
 - Use `cadref diff <left-entry-or-ref> <right-entry-or-ref> --json` for before/after comparison instead of manually eyeballing topology sidecars.
 
-Do not inspect viewer-derived runtime assets to figure out what a ref means. Resolve refs from STEP source data and deterministic generated selector artifacts.
+Do not inspect explorer-derived runtime assets to figure out what a ref means. Resolve refs from STEP source data and deterministic generated selector artifacts.
 
 ## Stale Refs
 
@@ -43,6 +43,6 @@ If the thread changes referenced geometry, regenerate the affected CAD output an
 
 After topology-changing steps, rebuild and re-resolve old face or edge ordinals before using them again.
 
-Unknown selectors may be treated as opaque viewer-generated handles unless the task is to change the reference system itself.
+Unknown selectors may be treated as opaque explorer-generated handles unless the task is to change the reference system itself.
 
-If you need to change how refs are generated, expanded, copied, or rendered, read the viewer documentation for the host project.
+If you need to change how refs are generated, expanded, copied, or rendered, read the explorer documentation for the host project.

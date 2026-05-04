@@ -1,73 +1,108 @@
 ---
 name: cad
-description: CAD workflows to programatically generate STEP/STL/3MF/DXF/GLB files; regenerate, inspect, validate, snapshot, resolve @cad refs, and hand off CAD Explorer links.
+description: Create, modify, inspect, validate, and review STEP-first build123d/Python CAD parts and assemblies. Use for natural-language CAD specs, STEP/STP generation, build123d source, build123d source-level joints, @cad references, geometry facts, measurements, mating deltas, CAD Explorer links, conditional review renders, and secondary DXF/STL/3MF outputs.
 ---
 
-# CAD Workflows
+# CAD generation, inspection, and validation
 
-## Workflow
+## Purpose
 
-1. Read project-local documentation only when project inventory, dependency notes, or preferred rebuild roots matter.
-2. Treat generator scripts and imported STEP files as source of truth. Do not hand-edit generated STEP, STL, 3MF, GLB, topology, DXF render payloads, or explorer-derived artifacts. Do not use git to track or compare changes between exported files; review source changes, deterministic summaries, snapshots, or CAD Explorer output instead.
-3. For generator and imported STEP/STP contracts, read `references/generator-contract.md`.
-4. If the prompt includes `@cad[...]` refs, read `references/prompt-refs.md` and resolve refs before editing with `cadref`; use `--detail --facts` for face, edge, corner, or occurrence-specific edits.
-5. For nontrivial geometry edits, read `references/geometry-workflow.md` and write a short geometry contract before editing.
-6. Edit only the owning generator or imported STEP source needed for the requested change.
-7. Regenerate explicit targets only. Do not run directory-wide generation.
-8. Validate with the cheapest proof that is strong enough. For validation and review images, read `references/validation-and-snapshots.md`.
-9. For displayable outputs, follow CAD Explorer Handoff unless browser handoff is explicitly unnecessary.
+Create or modify parametric CAD models from natural-language requirements, generate validated STEP/STP artifacts, inspect geometry references, and return checked outputs plus CAD Explorer links. Treat STEP as the primary CAD artifact. Treat DXF, STL, and 3MF as secondary workflows that branch from, or accompany, a STEP-first process. For assemblies, prefer source-level build123d joints and named mating datums when the parts have functional assembly relationships.
 
-## Prompt Artifacts
+## Use this skill when
 
-CAD Explorer may provide annotated screenshots and `@cad[...]` references. Treat screenshots as supporting context and `@cad[...]` refs as stable handles. If they disagree, trust the ref and source geometry, then use the screenshot to understand intent.
+Use this skill when the user asks for CAD files, STEP/STP files, build123d source, `@cad[...]` references, mechanical parts, assemblies, enclosures, brackets, fixtures, holes, counterbores, countersinks, slots, pockets, bosses, standoffs, ribs, fillets, chamfers, shells, source-level joints, mating, measurements, or CAD Explorer review links.
 
-For ref grammar, selector semantics, stale-ref handling, and geometry-fact workflows, read `references/prompt-refs.md` and use `scripts/cadref/cli.py`. Do not inspect explorer-derived runtime assets to interpret prompt refs; resolve refs from source STEP data and deterministic selector artifacts.
+Also use it when the user asks for DXF, STL, or 3MF output from CAD geometry. Keep those workflows secondary and load `dxf.md` or `supported-exports.md` for details.
 
-## CAD Explorer Handoff
+Do not use this skill for render-only concept art, CAM toolpaths, engineering certification, FEA conclusions, architectural BIM, or freehand illustration unless the user also needs CAD geometry.
 
-After editing or regenerating any CAD Explorer-displayable `.step`, `.stp`, `.stl`, `.3mf`, `.dxf`, or `.urdf` entry, make CAD Explorer available and include links for the affected entries in the final response.
+## Default assumptions
 
-Ensure the CAD Explorer server first:
+Use these defaults unless the user specifies otherwise:
+
+- Units: millimeters.
+- Origin: center of the main part or assembly unless a mating interface or fixed root component suggests a better origin.
+- Base plane: XY.
+- Up/extrusion axis: positive Z.
+- Output geometry: closed, positive-volume solids unless the user requests surfaces or construction geometry.
+- STEP structure: one valid solid, a compound of solids, or a labeled assembly compound.
+- Assembly structure: fixed root part, part-local frames, named mating datums, build123d joints where applicable, and explicit generated placements.
+- Small plastic enclosure wall: 2.0-3.0 mm when unspecified.
+- Cosmetic fillet: 1.0-3.0 mm when safe for local geometry.
+- M3/M4/M5 normal clearance holes: 3.4/4.5/5.5 mm unless another standard is requested.
+
+Ask one focused clarification question only when missing information makes the model impossible, fit-critical, safety-critical, or compliance-bound. Otherwise proceed with explicit assumptions.
+
+## Natural-language specs only
+
+Do not ask the user to provide a JSON specification and do not make JSON the user-facing workflow. Convert the user's prose into an internal CAD brief with dimensions, features, assumptions, output paths, and validation criteria. Use `references/natural-language-specs.md` for brief-writing patterns.
+
+## Root model
+
+Keep these roots separate:
+
+- **CAD skill directory**: this folder. Tool launchers live here as `scripts/step`, `scripts/inspect`, `scripts/render`, and `scripts/dxf`.
+- **Tool process cwd**: relative CAD targets are resolved from the command's current working directory. Use absolute target paths when running from the skill directory, or run from the workspace root and invoke the launchers with a path to this skill directory.
+- **Explorer scan root**: CAD Explorer scans `EXPLORER_ROOT_DIR` when set; otherwise it scans the workspace root inferred by Vite from `EXPLORER_WORKSPACE_ROOT`, npm `INIT_CWD`, or the Vite process cwd. Explorer `file=` links must be relative to the active scan root.
+
+Short command examples in this skill use launcher paths relative to the CAD skill directory. Adapt the launcher path or target path so project CAD files resolve from the intended workspace, not accidentally under the skill directory.
+
+Prefer keeping a STEP output and its Python generator in the same directory so the source stays easy to discover. Unless the user explicitly requests otherwise, keep the STEP basename and generator basename the same even when they cannot live side by side.
+
+## Available tools
+
+From the CAD skill directory, the launcher shape is:
 
 ```bash
-npm --prefix .agents/skills/cad/explorer run dev:ensure
+python scripts/step ...
+python scripts/inspect ...
+python scripts/render ...
+python scripts/dxf ...
+npm --prefix explorer run dev
+npm --prefix explorer run dev:ensure -- --file path/to/model.step
 ```
 
-Explorer link format:
+Use the active project Python interpreter. If only the repo-local virtualenv is available, invoke that interpreter while keeping the root model above explicit.
 
-```text
-http://127.0.0.1:4178/?file=<path-relative-to-explorer-root-with-extension>
-```
+Use `python scripts/<tool> --help` for the complete current command interface; reference docs show recommended workflows, not every flag.
 
-CAD Explorer scans `EXPLORER_ROOT_DIR`, which defaults to the command's current working directory when unset or empty. Run the server from the workspace you want to inspect, or set `EXPLORER_ROOT_DIR` to a directory inside that workspace. Keep a single reusable Explorer root for the dev server and make `file` relative to the active scan root, even when the changed entry is nested several directories below. Do not add `dir` query parameters or narrow the running server root merely because only one file changed; fix or report startup/catalog issues instead so the running dev server can be reused by other threads to inspect other entries under the same root.
+## Required workflow
 
-The `file` parameter must include the displayed file extension and should always be present for entry links.
+1. **Classify the task.** Identify whether this is a new part, new assembly, source modification, direct STEP/STP inspection, reference selection, measurement/mating check, render review, or secondary output request.
+2. **Load only the needed references.** Use the triggers below instead of reading the whole reference set.
+3. **Create a natural-language CAD brief.** Extract dimensions, units, coordinate convention, feature intent, output paths, assumptions, and validation targets.
+4. **Plan before coding.** Define parameters, labels, source paths, expected bounding boxes, and any mating/positioning datums before editing.
+5. **Edit source, not generated artifacts.** Prefer build123d Python with `gen_step()` for STEP generation.
+6. **Generate explicit targets.** Use `scripts/step` for STEP/STP generation and sidecars. Use `--kind part` or `--kind assembly` only for direct STEP/STP imports. Do not run directory-wide generation.
+7. **Validate geometrically.** Use `scripts/inspect refs --facts --planes --positioning`, then targeted `measure`, `mate`, `frame`, or `diff` when needed.
+8. **Return Explorer links.** Use `references/rendering-and-explorer.md` for Explorer startup, scan-root, and link rules.
+9. **Render conditionally.** Use `scripts/render` only when requested, Explorer is unavailable, visual ambiguity remains, or section/wireframe review answers a real validation question.
+10. **Repair and rerun.** If a check fails, change the smallest responsible source section, regenerate, and rerun the failed validation.
 
-For CAD prompt refs, keep the entry `file=` and append URL-encoded `refs=` parameters. Python generators are not Explorer entries; link their generated outputs. If only CAD Explorer app code changed, link the base CAD Explorer URL.
+## Non-negotiables
 
-Let generation tools own CAD Explorer-consumed render, topology, metadata, and sidecar artifacts. Do not hand-edit or build separate Explorer cache files unless the task is explicitly about the Explorer implementation itself.
+- Treat generated STEP/STP, STL, 3MF, GLB/topology, DXF outputs, and Explorer sidecars as derived artifacts.
+- Keep STEP as the primary validated CAD artifact; DXF/STL/3MF are secondary unless the user explicitly says otherwise.
+- When a Python generator exists, run `scripts/step` on the generator. Use a direct STEP/STP target only when the generator is unavailable or the user explicitly identifies that STEP/STP file as the target.
+- Use named parameters, closed solids, explicit labels, and source-controlled geometry intent.
+- Author assembly positioning in source with part-local datums, explicit `Location` transforms, or build123d joints. Treat CLI `inspect mate` as read-only validation, not as a source-editing API.
+- Do not use `git status`, `git diff`, or file-size churn as CAD comparison for large exported STEP/STP, GLB/topology, STL, 3MF, or DXF artifacts. Compare source changes, `scripts/inspect` summaries, targeted renders, or CAD Explorer output instead; use path-limited git status only for bookkeeping.
+- Report only checks that actually ran or are directly supported by tool output.
+- If Explorer fails, say so and rely on CLI inspection for validation.
 
-## Commands
+## Progressive references
 
-Run with the Python environment for the project or workspace. If the environment lacks the CAD runtime packages, install this skill's script dependencies from `requirements.txt`. Invoke tools as filesystem scripts, for example `python <cad-skill>/scripts/gen_step_part/cli.py ...`. Relative target paths are resolved from the current working directory; the tools do not prepend a harness root.
+Load these files only when their trigger applies:
 
-- Part STEP/render/topology: `scripts/gen_step_part/cli.py`
-- Assembly STEP/render/topology: `scripts/gen_step_assembly/cli.py`
-- DXF sidecars: `scripts/gen_dxf/cli.py`
-- Prompt refs and STEP facts: `scripts/cadref/cli.py`
-- Verification PNGs: `scripts/snapshot/cli.py`
+- `references/natural-language-specs.md` — converting prose requirements into a CAD brief without requiring user JSON.
+- `references/step-generation.md` — STEP generation, direct STEP/STP targets, part-vs-assembly behavior, and post-generation inspection.
+- `references/inspection-and-validation.md` — validation gates, `@cad[...]` refs, facts, planes, topology, measurements, mating, diff, frame, and final validation reporting.
+- `references/positioning.md` — part-local datums, assembly transforms, build123d joints, CLI mate validation, and positioning reports.
+- `references/rendering-and-explorer.md` — CAD Explorer links and conditional render view/wireframe/section/list.
+- `references/dxf.md` — secondary DXF workflow.
+- `references/supported-exports.md` — secondary STL/3MF sidecar workflows.
+- `references/build123d-modeling.md` — build123d modeling patterns, topology, selectors, features, assemblies.
+- `references/repair-loop.md` — diagnosis and repair procedures.
 
-The command interfaces are target-explicit. The STEP tools accept generated Python sources or direct STEP/STP files. `gen_dxf` accepts Python sources that define `gen_dxf()`. `cadref` and `snapshot` use the input shapes described in their references. Use `--summary` where supported. Direct STEP/STP targets can receive import metadata as CLI flags on `gen_step_part` and `gen_step_assembly`.
-
-## References
-
-- STEP part generation: `references/gen-step-part.md`
-- STEP assembly generation: `references/gen-step-assembly.md`
-- DXF generation: `references/gen-dxf.md`
-- Generator and imported STEP/STP contracts: `references/generator-contract.md`
-- Geometry edit workflow: `references/geometry-workflow.md`
-- Prompt references: `references/prompt-refs.md`
-- Validation and snapshots: `references/validation-and-snapshots.md`
-- `@cad[...]` inspection: `references/cadref.md`
-- Snapshot rendering: `references/snapshot.md`
-- Shared implementation notes: `references/common-library.md`
+Final responses should include generated files, CAD Explorer links, validation actually run, assumptions, and caveats. Use `references/inspection-and-validation.md` for report structure.

@@ -17,10 +17,13 @@ import {
   normalizeExplorerDefaultFile,
   normalizeExplorerGithubUrl,
 } from "./lib/explorerConfig.mjs";
+import {
+  DEFAULT_EXPLORER_PORT,
+  buildExplorerServerInfo,
+  normalizeExplorerPort,
+} from "./lib/explorerServerInfo.mjs";
 
-const DEFAULT_EXPLORER_PORT = 4178;
-const resolvedPort = Number.parseInt(process.env.EXPLORER_PORT || "", 10);
-const explorerPort = Number.isFinite(resolvedPort) ? resolvedPort : DEFAULT_EXPLORER_PORT;
+const explorerPort = normalizeExplorerPort(process.env.EXPLORER_PORT, DEFAULT_EXPLORER_PORT);
 const explorerAppRoot = path.dirname(fileURLToPath(import.meta.url));
 const defaultWorkspaceRoot = path.resolve(explorerAppRoot, "../../../..");
 const workspaceRoot = resolveWorkspaceRoot();
@@ -230,6 +233,19 @@ function cadCatalogPlugin() {
     },
     configureServer(server) {
       const servedExplorerRoot = activateDirectory(server, buildExplorerRootDir);
+      server.middlewares.use((req, res, next) => {
+        const requestUrl = new URL(req.url || "/", "http://localhost");
+        if (requestUrl.pathname !== "/__cad/server") {
+          next();
+          return;
+        }
+        sendJson(res, 200, buildExplorerServerInfo({
+          workspaceRoot: repoRoot,
+          rootDir: buildExplorerRootDir,
+          port: explorerPort,
+          pid: process.pid,
+        }));
+      });
       server.middlewares.use((req, res, next) => {
         const requestUrl = new URL(req.url || "/", "http://localhost");
         if (requestUrl.pathname !== "/__cad/catalog") {

@@ -27,12 +27,20 @@ function relationArray(manifest, buffers, relationKey, viewKey) {
   return [];
 }
 
+function typedBufferView(manifest, buffers, manifestSectionKey, viewKey) {
+  const viewName = manifest?.[manifestSectionKey]?.[viewKey];
+  if (typeof viewName === "string" && buffers?.[viewName]) {
+    return buffers[viewName];
+  }
+  return new Uint32Array(0);
+}
+
 function selectorPrefix(singleOccurrenceId, selector) {
   if (!singleOccurrenceId || !selector.startsWith(`${singleOccurrenceId}.`)) {
     return selector;
   }
   const suffix = selector.slice(singleOccurrenceId.length + 1);
-  return suffix.startsWith("s") || suffix.startsWith("f") || suffix.startsWith("e") || suffix.startsWith("v") ? suffix : selector;
+  return suffix.startsWith("s") || suffix.startsWith("f") || suffix.startsWith("e") ? suffix : selector;
 }
 
 function selectorTypeLabel(selectorType) {
@@ -44,9 +52,6 @@ function selectorTypeLabel(selectorType) {
   }
   if (selectorType === "face") {
     return "Face";
-  }
-  if (selectorType === "vertex") {
-    return "Corner";
   }
   return "Edge";
 }
@@ -163,15 +168,59 @@ function referenceSummary(selectorType, row) {
   if (selectorType === "face") {
     return `${row.surfaceType || "face"} area=${row.area ?? 0}`;
   }
-  if (selectorType === "vertex") {
-    return `corner edges=${row.edgeCount ?? 0}`;
-  }
   return `${row.curveType || "edge"} length=${row.length ?? 0}`;
 }
 
-function selectorForRow(selectorType, row, rowIndex, singleOccurrenceId, remapOccurrenceId = "") {
+function sourceOccurrenceMatchesFilter(sourceOccurrenceId, filterOccurrenceId) {
+  const sourceId = String(sourceOccurrenceId || "").trim();
+  const filterId = String(filterOccurrenceId || "").trim();
+  return !filterId || sourceId === filterId || sourceId.startsWith(`${filterId}.`);
+}
+
+function remapSourceOccurrenceId(sourceOccurrenceId, remapOccurrencePrefix) {
+  const sourceId = String(sourceOccurrenceId || "").trim();
+  if (!sourceId || !remapOccurrencePrefix || typeof remapOccurrencePrefix !== "object") {
+    return "";
+  }
+  if (!sourceOccurrenceMatchesFilter(sourceId, remapOccurrencePrefix.sourceOccurrenceId)) {
+    return "";
+  }
+  const sourceRootId = String(remapOccurrencePrefix.sourceRootOccurrenceId || "").trim();
+  const targetRootId = String(remapOccurrencePrefix.targetRootOccurrenceId || "").trim();
+  if (!sourceRootId || !targetRootId) {
+    return "";
+  }
+  if (sourceId === sourceRootId) {
+    return targetRootId;
+  }
+  const sourceRootPrefix = `${sourceRootId}.`;
+  if (sourceId.startsWith(sourceRootPrefix)) {
+    return `${targetRootId}.${sourceId.slice(sourceRootPrefix.length)}`;
+  }
+  return "";
+}
+
+function selectorForRow(selectorType, row, rowIndex, singleOccurrenceId, remapOccurrenceId = "", remapOccurrencePrefix = null) {
   if (!row || !Number.isFinite(Number(rowIndex))) {
     return "";
+  }
+  if (remapOccurrencePrefix && typeof remapOccurrencePrefix === "object") {
+    const sourceOccurrenceId = selectorType === "occurrence"
+      ? String(row?.id || "").trim()
+      : String(row?.occurrenceId || "").trim();
+    const occurrenceId = remapSourceOccurrenceId(sourceOccurrenceId, remapOccurrencePrefix);
+    if (!occurrenceId) {
+      return "";
+    }
+    if (selectorType === "occurrence") {
+      return occurrenceId;
+    }
+    const selectorKind = selectorType === "shape"
+      ? "s"
+      : selectorType === "face"
+        ? "f"
+        : "e";
+    return `${occurrenceId}.${selectorKind}${rowIndex + 1}`;
   }
   const occurrenceId = String(remapOccurrenceId || "").trim();
   if (occurrenceId) {
@@ -182,19 +231,19 @@ function selectorForRow(selectorType, row, rowIndex, singleOccurrenceId, remapOc
       ? "s"
       : selectorType === "face"
         ? "f"
-        : selectorType === "vertex"
-          ? "v"
-          : "e";
+        : "e";
     return `${occurrenceId}.${selectorKind}${rowIndex + 1}`;
   }
   return selectorPrefix(singleOccurrenceId, String(row?.id || "").trim());
 }
 
-function buildAdjacencySelectors(row, relationRows, targetRows, singleOccurrenceId, idKey, startKey, countKey, targetSelectorType, remapOccurrenceId) {
+function buildAdjacencySelectors(row, relationRows, targetRows, singleOccurrenceId, idKey, startKey, countKey, targetSelectorType, remapOccurrenceId, remapOccurrencePrefix) {
   const start = Number(row?.[startKey] || 0);
   const count = Number(row?.[countKey] || 0);
   const selectors = [];
-  for (const rowIndex of Array.from(relationRows).slice(start, start + count)) {
+  const end = Math.min(relationRows?.length || 0, start + count);
+  for (let index = start; index < end; index += 1) {
+    const rowIndex = relationRows[index];
     const targetRowIndex = Number(rowIndex);
     const targetRow = targetRows[targetRowIndex];
     const selector = selectorForRow(
@@ -202,7 +251,8 @@ function buildAdjacencySelectors(row, relationRows, targetRows, singleOccurrence
       targetRow,
       targetRowIndex,
       singleOccurrenceId,
-      remapOccurrenceId
+      remapOccurrenceId,
+      remapOccurrencePrefix
     ) || String(targetRow?.[idKey] || "").trim();
     if (selector) {
       selectors.push(selector);
@@ -225,9 +275,10 @@ function buildReference({
   startKey,
   countKey,
   remapOccurrenceId = "",
+  remapOccurrencePrefix = null,
   targetSelectorType = "",
 }) {
-  const normalizedSelector = selectorForRow(selectorType, row, rowIndex, singleOccurrenceId, remapOccurrenceId);
+  const normalizedSelector = selectorForRow(selectorType, row, rowIndex, singleOccurrenceId, remapOccurrenceId, remapOccurrencePrefix);
   const displaySelector = normalizedSelector;
   const id = referenceIdForRow(displaySelector, selectorType, partId);
   const summary = referenceSummary(selectorType, row);
@@ -242,7 +293,8 @@ function buildReference({
       startKey,
       countKey,
       targetSelectorType,
-      remapOccurrenceId
+      remapOccurrenceId,
+      remapOccurrencePrefix
     )
     : [];
   return {
@@ -317,13 +369,12 @@ export function buildSelectorRuntime(bundle, {
   partId = "",
   transform = null,
   remapOccurrenceId = "",
+  remapOccurrencePrefix = null,
 } = {}) {
   const manifest = bundle?.manifest || {};
   const buffers = bundle?.buffers || {};
   const faceRelations = relationArray(manifest, buffers, "faceEdgeRows", "faceEdgeRowsView");
   const edgeRelations = relationArray(manifest, buffers, "edgeFaceRows", "edgeFaceRowsView");
-  const edgeVertexRelations = relationArray(manifest, buffers, "edgeVertexRows", "edgeVertexRowsView");
-  const vertexEdgeRelations = relationArray(manifest, buffers, "vertexEdgeRows", "vertexEdgeRowsView");
   const occurrences = transformRows(toRows(manifest, "occurrences", "occurrenceColumns"), transform);
   const shapes = transformRows(toRows(manifest, "shapes", "shapeColumns"), transform);
   const faces = applySequentialRelationStarts(
@@ -332,11 +383,7 @@ export function buildSelectorRuntime(bundle, {
   );
   const edges = applySequentialRelationStarts(
     transformRows(toRows(manifest, "edges", "edgeColumns"), transform),
-    [["faceStart", "faceCount"], ["vertexStart", "vertexCount"]]
-  );
-  const vertices = applySequentialRelationStarts(
-    transformRows(toRows(manifest, "vertices", "vertexColumns"), transform),
-    [["edgeStart", "edgeCount"]]
+    [["faceStart", "faceCount"]]
   );
   const leafOccurrenceIds = buildLeafOccurrenceIds(shapes);
   const singleOccurrenceId = leafOccurrenceIds.length === 1 ? leafOccurrenceIds[0] : "";
@@ -344,15 +391,13 @@ export function buildSelectorRuntime(bundle, {
     facePositions: transformPositions(buffers.facePositions, transform),
     faceIndices: buffers.faceIndices || new Uint32Array(0),
     faceIds: buffers.faceIds || new Uint32Array(0),
+    faceRuns: typedBufferView(manifest, buffers, "faceProxy", "runsView"),
+    faceRunColumns: Array.isArray(manifest?.faceProxy?.runColumns) ? manifest.faceProxy.runColumns : [],
     edgePositions: transformPositions(buffers.edgePositions, transform),
     edgeIndices: buffers.edgeIndices || new Uint32Array(0),
     edgeIds: buffers.edgeIds || new Uint32Array(0),
-    vertexPositions: transformPositions(buffers.vertexPositions, transform),
-    vertexIds: buffers.vertexIds || new Uint32Array(0),
     faceEdgeRows: faceRelations,
     edgeFaceRows: edgeRelations,
-    edgeVertexRows: edgeVertexRelations,
-    vertexEdgeRows: vertexEdgeRelations,
   };
 
   const references = [];
@@ -365,6 +410,7 @@ export function buildSelectorRuntime(bundle, {
     partId,
     selectorTransform: transform,
     remapOccurrenceId,
+    remapOccurrencePrefix,
   })));
   references.push(...shapes.map((row, rowIndex) => buildReference({
     selectorType: "shape",
@@ -375,6 +421,7 @@ export function buildSelectorRuntime(bundle, {
     partId,
     selectorTransform: transform,
     remapOccurrenceId,
+    remapOccurrencePrefix,
   })));
   references.push(...faces.map((row, rowIndex) => buildReference({
     selectorType: "face",
@@ -390,6 +437,7 @@ export function buildSelectorRuntime(bundle, {
     startKey: "edgeStart",
     countKey: "edgeCount",
     remapOccurrenceId,
+    remapOccurrencePrefix,
     targetSelectorType: "edge",
   })));
   references.push(...edges.map((row, rowIndex) => buildReference({
@@ -406,46 +454,32 @@ export function buildSelectorRuntime(bundle, {
     startKey: "faceStart",
     countKey: "faceCount",
     remapOccurrenceId,
+    remapOccurrencePrefix,
     targetSelectorType: "face",
   })));
-  references.push(...vertices.map((row, rowIndex) => buildReference({
-    selectorType: "vertex",
-    row,
-    rowIndex,
-    singleOccurrenceId,
-    copyCadPath,
-    partId,
-    selectorTransform: transform,
-    relationRows: vertexEdgeRelations,
-    targetRows: edges,
-    targetKey: "id",
-    startKey: "edgeStart",
-    countKey: "edgeCount",
-    remapOccurrenceId,
-    targetSelectorType: "edge",
-  })));
-
-  const referenceMap = new Map(references.map((reference) => [reference.id, reference]));
+  const visibleReferences = references.filter((reference) => String(reference?.normalizedSelector || "").trim());
+  const referenceMap = new Map(visibleReferences.map((reference) => [reference.id, reference]));
   const referenceByNormalizedSelector = new Map(
-    references.map((reference) => [reference.normalizedSelector, reference])
+    visibleReferences.map((reference) => [reference.normalizedSelector, reference])
   );
   const referenceByDisplaySelector = new Map(
-    references.map((reference) => [reference.displaySelector, reference])
+    visibleReferences.map((reference) => [reference.displaySelector, reference])
   );
   const faceReferenceByRowIndex = new Map(
-    references
+    visibleReferences
       .filter((reference) => reference.selectorType === "face")
       .map((reference) => [reference.rowIndex, reference])
   );
   const edgeReferenceByRowIndex = new Map(
-    references
+    visibleReferences
       .filter((reference) => reference.selectorType === "edge")
       .map((reference) => [reference.rowIndex, reference])
   );
-  const vertexReferenceByRowIndex = new Map(
-    references
-      .filter((reference) => reference.selectorType === "vertex")
-      .map((reference) => [reference.rowIndex, reference])
+  const occurrenceIdByRowIndex = new Map(
+    occurrences.map((row, rowIndex) => [
+      rowIndex,
+      selectorForRow("occurrence", row, rowIndex, singleOccurrenceId, remapOccurrenceId, remapOccurrencePrefix) || String(row?.id || "").trim()
+    ])
   );
   return {
     cadPath: copyCadPath || String(manifest.cadRef || "").trim(),
@@ -455,17 +489,18 @@ export function buildSelectorRuntime(bundle, {
     shapes,
     faces,
     edges,
-    vertices,
-    references,
+    vertices: [],
+    references: visibleReferences,
     referenceMap,
     referenceByNormalizedSelector,
     referenceByDisplaySelector,
     faceReferenceByRowIndex,
     edgeReferenceByRowIndex,
-    vertexReferenceByRowIndex,
-    faceReferenceMap: new Map(references.filter((reference) => reference.selectorType === "face").map((reference) => [reference.id, reference])),
-    edgeReferenceMap: new Map(references.filter((reference) => reference.selectorType === "edge").map((reference) => [reference.id, reference])),
-    vertexReferenceMap: new Map(references.filter((reference) => reference.selectorType === "vertex").map((reference) => [reference.id, reference])),
+    vertexReferenceByRowIndex: new Map(),
+    occurrenceIdByRowIndex,
+    faceReferenceMap: new Map(visibleReferences.filter((reference) => reference.selectorType === "face").map((reference) => [reference.id, reference])),
+    edgeReferenceMap: new Map(visibleReferences.filter((reference) => reference.selectorType === "edge").map((reference) => [reference.id, reference])),
+    vertexReferenceMap: new Map(),
     singleOccurrenceId,
     proxy: selectorBuffers,
   };

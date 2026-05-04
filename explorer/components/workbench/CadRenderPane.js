@@ -4,6 +4,7 @@ import DxfExplorer from "../DxfExplorer";
 import { X } from "lucide-react";
 import { Alert, AlertDescription, AlertTitle } from "../ui/alert";
 import { Button } from "../ui/button";
+import ExplorerAlertCommand from "./ExplorerAlertCommand";
 import { RENDER_FORMAT } from "../../lib/workbench/constants";
 import { LOOK_FLOOR_MODES } from "../../lib/lookSettings";
 import { EXPLORER_SCENE_SCALE } from "../../lib/explorer/sceneScale";
@@ -25,7 +26,6 @@ export default function CadRenderPane({
   explorerPerspectiveRef,
   lookSettings,
   previewMode,
-  isDesktop,
   viewportFrameInsets,
   explorerLoading,
   explorerAlert,
@@ -44,7 +44,7 @@ export default function CadRenderPane({
   pickableFaces,
   pickableEdges,
   pickableVertices,
-  inspectedAssemblyPartId,
+  focusedPartIds = "",
   drawToolActive,
   drawingTool,
   drawingStrokes,
@@ -63,6 +63,7 @@ export default function CadRenderPane({
 }) {
   const explorerAlertVariant = explorerAlert?.severity === "warning" ? "warning" : "destructive";
   const explorerAlertSummaryClasses = explorerAlert?.severity === "warning" ? "text-chart-5" : "text-destructive";
+  const compactExplorerAlert = Boolean(explorerAlert?.compact);
   const dxfMode = renderFormat === RENDER_FORMAT.DXF;
   const urdfMode = renderFormat === RENDER_FORMAT.URDF;
   const stlMode = renderFormat === RENDER_FORMAT.STL;
@@ -84,11 +85,8 @@ export default function CadRenderPane({
     : selectionCount > 0
       ? "selection"
       : "";
-  const mobileBottomOverlayOffset = ctaMode === "screenshot"
-    ? "calc(env(safe-area-inset-bottom, 0px) + 10.25rem)"
-    : "calc(env(safe-area-inset-bottom, 0px) + 7.25rem)";
   const bottomOverlayStyle = {
-    bottom: isDesktop ? "1rem" : mobileBottomOverlayOffset
+    bottom: "1rem"
   };
   const ctaLabel = ctaMode === "screenshot" ? "Copy Screenshot" : copyButtonLabel;
   const ctaTitle = ctaMode === "screenshot" ? "Copy screenshot to clipboard" : copyButtonLabel;
@@ -141,8 +139,8 @@ export default function CadRenderPane({
           floorModeOverride={dxfMode ? LOOK_FLOOR_MODES.GRID : ""}
           sceneScaleMode={urdfMode ? EXPLORER_SCENE_SCALE.URDF : EXPLORER_SCENE_SCALE.CAD}
           viewPlaneOffsetRight={viewPlaneOffsetRight}
-          viewPlaneOffsetBottom={isDesktop ? "1rem" : "calc(env(safe-area-inset-bottom, 0px) + 6rem)"}
-          compactViewPlane={!isDesktop}
+          viewPlaneOffsetBottom="1rem"
+          compactViewPlane={false}
           viewportFrameInsets={viewportFrameInsets}
           isLoading={explorerLoading}
           pickMode={
@@ -161,7 +159,7 @@ export default function CadRenderPane({
           pickableFaces={dxfMode || meshOnlyMode ? [] : pickableFaces}
           pickableEdges={dxfMode || meshOnlyMode ? [] : pickableEdges}
           pickableVertices={dxfMode || meshOnlyMode ? [] : pickableVertices}
-          focusedPartId={dxfMode || meshOnlyMode ? "" : inspectedAssemblyPartId}
+          focusedPartId={dxfMode || meshOnlyMode ? "" : focusedPartIds}
           drawingEnabled={!dxfMode && !meshOnlyMode && drawToolActive}
           drawingTool={drawingTool}
           drawingStrokes={dxfMode || meshOnlyMode ? [] : drawingStrokes}
@@ -195,28 +193,23 @@ export default function CadRenderPane({
         <div className="pointer-events-none absolute inset-0 z-30 flex items-center justify-center px-4">
           <Alert
             variant={explorerAlertVariant}
-            className="cad-glass-popover pointer-events-auto w-full max-w-xl p-5 shadow-lg"
+            className={`cad-glass-popover pointer-events-auto w-full shadow-lg ${compactExplorerAlert ? "max-w-lg p-4" : "max-w-xl p-5"}`}
           >
-            <p className={`col-start-1 text-[11px] font-semibold uppercase tracking-[0.16em] ${explorerAlertSummaryClasses}`}>
-              {explorerAlert.summary || "Explorer error"}
-            </p>
-            <AlertTitle className="col-start-1 mt-1 line-clamp-none text-lg text-foreground">{explorerAlert.title}</AlertTitle>
-            <AlertDescription className="col-start-1 mt-1 gap-2 text-sm leading-6">
+            {compactExplorerAlert ? null : (
+              <p className={`col-start-1 text-[11px] font-semibold uppercase tracking-[0.16em] ${explorerAlertSummaryClasses}`}>
+                {explorerAlert.summary || "Explorer error"}
+              </p>
+            )}
+            <AlertTitle className={`col-start-1 line-clamp-none text-foreground ${compactExplorerAlert ? "text-base" : "mt-1 text-lg"}`}>{explorerAlert.title}</AlertTitle>
+            <AlertDescription className={`col-start-1 mt-1 gap-2 ${compactExplorerAlert ? "text-xs leading-5 whitespace-pre-line" : "text-sm leading-6"}`}>
               <p>{explorerAlert.message}</p>
-              {explorerAlert.resolution ? (
+              {!compactExplorerAlert && explorerAlert.resolution ? (
                 <p className="text-muted-foreground/80">{explorerAlert.resolution}</p>
               ) : null}
             </AlertDescription>
-            {explorerAlert.command ? (
-              <div className="col-start-1 mt-2">
-                <p className="text-[11px] font-semibold uppercase tracking-[0.16em] text-muted-foreground">
-                  Rebuild command
-                </p>
-                <code className="mt-1.5 block rounded-md bg-muted px-3 py-2 text-xs leading-6 text-foreground">
-                  {explorerAlert.command}
-                </code>
-              </div>
-            ) : null}
+            <div className="col-start-1">
+              <ExplorerAlertCommand command={explorerAlert.command} />
+            </div>
           </Alert>
         </div>
       ) : null}
@@ -275,14 +268,14 @@ export default function CadRenderPane({
       ) : null}
       {!previewMode && ctaMode && !stepUpdateInProgress && !topologySelectionPending && !topologySelectionUnavailable ? (
         <div
-          className="pointer-events-none absolute left-1/2 z-20 -translate-x-1/2"
+          className="pointer-events-none absolute inset-x-4 z-20 flex justify-center"
           style={bottomOverlayStyle}
         >
           <Button
             type="button"
             variant="default"
             size="sm"
-            className="pointer-events-auto h-9 max-w-[min(calc(100vw-2rem),52rem)] border border-white bg-white px-4 text-[12px] font-semibold text-black shadow-lg shadow-black/20 hover:bg-white/90 focus-visible:ring-white/40 dark:border-white dark:bg-white dark:text-black dark:hover:bg-white/90"
+            className="pointer-events-auto h-9 min-w-0 max-w-[52rem] border border-white bg-white px-4 text-[12px] font-semibold text-black shadow-lg shadow-black/20 hover:bg-white/90 focus-visible:ring-white/40 dark:border-white dark:bg-white dark:text-black dark:hover:bg-white/90 max-sm:w-full"
             disabled={ctaDisabled}
             onClick={() => {
               if (ctaMode === "screenshot") {
@@ -293,7 +286,7 @@ export default function CadRenderPane({
             }}
             title={ctaTitle}
           >
-            <span className="truncate">{ctaLabel}</span>
+            <span className="min-w-0 truncate">{ctaLabel}</span>
           </Button>
         </div>
       ) : null}

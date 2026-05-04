@@ -8,8 +8,8 @@ import {
 } from "./explorerConfig.mjs";
 
 test("normalizeExplorerDefaultFile keeps scan-relative file paths", () => {
-  assert.equal(normalizeExplorerDefaultFile("/STEP/robot_arm.step/"), "STEP/robot_arm.step");
-  assert.equal(normalizeExplorerDefaultFile("STEP\\robot_arm.step"), "STEP/robot_arm.step");
+  assert.equal(normalizeExplorerDefaultFile("/STEP/sample_part.step/"), "STEP/sample_part.step");
+  assert.equal(normalizeExplorerDefaultFile("STEP\\sample_part.step"), "STEP/sample_part.step");
 });
 
 test("normalizeExplorerGithubUrl defaults to the project repository", () => {

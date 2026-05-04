@@ -7,20 +7,15 @@ from typing import Any, Callable, Mapping, Sequence
 from common.assembly_spec import (
     IDENTITY_TRANSFORM,
     AssemblySpec,
-    AssemblyNodeSpec,
     assembly_spec_children,
     multiply_transforms,
 )
-from common.render import (
-    part_glb_path,
-    part_selector_manifest_path,
-    relative_to_repo,
-    sha256_file,
-)
+from common.glb import read_step_topology_manifest_from_glb
+from common.render import existing_part_glb_path, part_glb_path, relative_to_repo, sha256_file
 
 
 ASSEMBLY_COMPOSITION_SCHEMA_VERSION = 1
-TOPOLOGY_COUNT_KEYS = ("shapeCount", "faceCount", "edgeCount", "vertexCount")
+TOPOLOGY_COUNT_KEYS = ("shapeCount", "faceCount", "edgeCount")
 
 
 class AssemblyCompositionError(ValueError):
@@ -40,6 +35,18 @@ def _versioned_relative_url(topology_path: Path, target_path: Path, content_hash
     return f"{_relative_to_topology(topology_path, target_path)}{suffix}"
 
 
+def _assembly_mesh_payload(topology_path: Path, mesh_path: Path) -> dict[str, Any]:
+    mesh_hash = sha256_file(mesh_path) if mesh_path.exists() else ""
+    return {
+        "url": _versioned_relative_url(topology_path, mesh_path, mesh_hash)
+        if mesh_hash
+        else _relative_to_topology(topology_path, mesh_path),
+        "hash": mesh_hash,
+        "addressing": "gltf-node-extras",
+        "occurrenceIdKey": "cadOccurrenceId",
+    }
+
+
 def build_linked_assembly_composition(
     *,
     cad_ref: str,
@@ -48,6 +55,7 @@ def build_linked_assembly_composition(
     assembly_spec: AssemblySpec,
     entries_by_step_path: Mapping[Path, object],
     read_assembly_spec: Callable[[Path], AssemblySpec],
+    mesh_path: Path,
 ) -> dict[str, Any]:
     occurrences = _rows(topology_manifest, "occurrences", "occurrenceColumns")
     if not occurrences:
@@ -76,6 +84,7 @@ def build_linked_assembly_composition(
     return {
         "schemaVersion": ASSEMBLY_COMPOSITION_SCHEMA_VERSION,
         "mode": "linked",
+        "mesh": _assembly_mesh_payload(topology_path, mesh_path),
         "root": _assembly_root_node(cad_ref, root_occurrence, children),
     }
 
@@ -85,7 +94,7 @@ def build_native_assembly_composition(
     cad_ref: str,
     topology_path: Path,
     topology_manifest: dict[str, Any],
-    component_mesh_paths: Mapping[str, Path],
+    mesh_path: Path,
 ) -> dict[str, Any]:
     occurrences = _rows(topology_manifest, "occurrences", "occurrenceColumns")
     if not occurrences:
@@ -115,7 +124,6 @@ def build_native_assembly_composition(
         _native_occurrence_node(
             row,
             children_by_parent=children_by_parent,
-            component_mesh_paths=component_mesh_paths,
             topology_path=topology_path,
             parent_world_transform=IDENTITY_TRANSFORM,
         )
@@ -126,7 +134,6 @@ def build_native_assembly_composition(
         children = [
             _native_part_node(
                 row,
-                component_mesh_paths=component_mesh_paths,
                 topology_path=topology_path,
                 parent_world_transform=IDENTITY_TRANSFORM,
             )
@@ -134,6 +141,7 @@ def build_native_assembly_composition(
     return {
         "schemaVersion": ASSEMBLY_COMPOSITION_SCHEMA_VERSION,
         "mode": "native",
+        "mesh": _assembly_mesh_payload(topology_path, mesh_path),
         "root": _assembly_root_node(cad_ref, root_occurrence, children),
     }
 
@@ -160,13 +168,15 @@ def _linked_instance_node(
     world_transform = multiply_transforms(parent_world_transform, instance_transform)
     source_step_path = getattr(source_spec, "step_path", None) if source_spec is not None else None
     source_path = _relative_to_topology(topology_path, Path(source_step_path)) if source_step_path is not None else (instance.path or "")
+    # Instance names are the authored assembly labels; fall back to source/path
+    # stems only for legacy or incomplete specs.
     display_name = str(
-        (
+        instance.name
+        or (
             Path(source_step_path).stem
             if source_step_path is not None
             else Path(instance.path or "").stem
         )
-        or instance.name
         or instance_path[-1]
     ).strip()
     use_source_colors = parent_use_source_colors and bool(instance.use_source_colors)
@@ -303,7 +313,7 @@ def _linked_instance_node(
         occurrence_id = str(occurrence.get("id") or "").strip()
         return _linked_native_assembly_node(
             topology_path=topology_path,
-            source_topology_path=part_selector_manifest_path(Path(source_step_path)),
+            source_topology_path=existing_part_glb_path(Path(source_step_path)) or part_glb_path(Path(source_step_path)),
             source_assembly=native_source_assembly,
             source_path=source_path,
             occurrence=occurrence,
@@ -328,7 +338,7 @@ def _linked_instance_node(
             )
         if source_step_path is None:
             raise AssemblyCompositionError(f"{cad_ref} component {component_name(instance_path)} is missing STEP source")
-        source_counts = _source_topology_counts(part_selector_manifest_path(Path(source_step_path)))
+        source_counts = _source_topology_counts(existing_part_glb_path(Path(source_step_path)) or part_glb_path(Path(source_step_path)))
         occurrence_counts = _occurrence_topology_counts(occurrence)
         if source_counts != occurrence_counts:
             raise AssemblyCompositionError(
@@ -336,8 +346,6 @@ def _linked_instance_node(
                 f"{source_path}: source={source_counts} assembly={occurrence_counts}"
             )
         occurrence_id = str(occurrence.get("id") or "").strip()
-        glb_path = part_glb_path(Path(source_step_path))
-        glb_hash = sha256_file(glb_path) if glb_path.exists() else ""
         return _part_node(
             id=occurrence_id,
             occurrence_id=occurrence_id,
@@ -350,8 +358,6 @@ def _linked_instance_node(
             world_transform=tuple(float(value) for value in occurrence.get("transform") or world_transform),
             bbox=occurrence.get("bbox"),
             topology_counts=_public_topology_counts(occurrence_counts),
-            asset_url=_versioned_relative_url(topology_path, glb_path, glb_hash) if glb_hash else "",
-            asset_hash=glb_hash,
         )
 
     raise AssemblyCompositionError(
@@ -360,16 +366,42 @@ def _linked_instance_node(
 
 
 def _source_assembly_payload(step_path: Path) -> dict[str, Any] | None:
-    topology_path = part_selector_manifest_path(step_path)
-    try:
-        payload = _read_json(topology_path)
-    except AssemblyCompositionError:
+    source_topology_path = existing_part_glb_path(step_path) or part_glb_path(step_path)
+    payload = read_step_topology_manifest_from_glb(source_topology_path)
+    if payload is None:
         return None
     assembly = payload.get("assembly")
     root = assembly.get("root") if isinstance(assembly, dict) else None
-    if not isinstance(root, dict) or not root.get("children"):
+    if isinstance(root, dict) and root.get("children"):
+        return assembly
+    if not _manifest_has_native_assembly_structure(payload):
         return None
-    return assembly
+    native_payload = build_native_assembly_composition(
+        cad_ref=relative_to_repo(step_path.with_suffix("")),
+        topology_path=source_topology_path,
+        topology_manifest=payload,
+        mesh_path=source_topology_path,
+    )
+    native_root = native_payload.get("root")
+    if not isinstance(native_root, dict) or not native_root.get("children"):
+        return None
+    return native_payload
+
+
+def _manifest_has_native_assembly_structure(payload: Mapping[str, Any]) -> bool:
+    occurrences = _rows(dict(payload), "occurrences", "occurrenceColumns")
+    if len(occurrences) <= 1:
+        return False
+    occurrence_ids = {
+        str(row.get("id") or "").strip()
+        for row in occurrences
+        if str(row.get("id") or "").strip()
+    }
+    for row in occurrences:
+        parent_id = str(row.get("parentId") or "").strip()
+        if parent_id and parent_id in occurrence_ids:
+            return True
+    return False
 
 
 def _linked_native_assembly_node(
@@ -411,6 +443,8 @@ def _linked_native_assembly_node(
             topology_path=topology_path,
             source_topology_path=source_topology_path,
             source_root_occurrence_id=source_root_occurrence_id,
+            source_path=source_path,
+            source_root_target_occurrence_id=occurrence_id,
             target_parent_occurrence_id=occurrence_id,
             parent_world_transform=world_transform,
             parent_instance_path=instance_path,
@@ -435,8 +469,13 @@ def _linked_native_assembly_node(
             for child in source_children
             if isinstance(child, Mapping)
         ]
+    source_root_target_occurrence_id = occurrence_id
+    for child in child_nodes:
+        if str(child.get("sourceOccurrenceId") or "").strip() == source_root_occurrence_id:
+            source_root_target_occurrence_id = str(child.get("occurrenceId") or child.get("id") or occurrence_id).strip()
+            break
     child_counts = _sum_public_counts(child_nodes)
-    return _assembly_node(
+    node = _assembly_node(
         id=occurrence_id,
         occurrence_id=occurrence_id,
         display_name=display_name,
@@ -450,6 +489,13 @@ def _linked_native_assembly_node(
         topology_counts=child_counts if _counts_have_values(child_counts) else _public_topology_counts(_occurrence_topology_counts(occurrence)),
         children=child_nodes,
     )
+    _attach_native_source_metadata(
+        node,
+        source_occurrence_id=source_root_occurrence_id,
+        source_root_occurrence_id=source_root_occurrence_id,
+        source_root_target_occurrence_id=source_root_target_occurrence_id,
+    )
+    return node
 
 
 def _clone_native_source_node(
@@ -460,6 +506,8 @@ def _clone_native_source_node(
     topology_path: Path,
     source_topology_path: Path,
     source_root_occurrence_id: str,
+    source_path: str,
+    source_root_target_occurrence_id: str,
     target_parent_occurrence_id: str,
     parent_world_transform: tuple[float, ...],
     parent_instance_path: str,
@@ -475,6 +523,11 @@ def _clone_native_source_node(
             target_parent_occurrence_id=target_parent_occurrence_id,
         )
     )
+    next_source_root_target_occurrence_id = (
+        occurrence_id
+        if source_root_occurrence_id and source_occurrence_id == source_root_occurrence_id
+        else source_root_target_occurrence_id
+    )
     source_world_transform = _transform_tuple(source_node.get("worldTransform"), IDENTITY_TRANSFORM)
     source_local_transform = _transform_tuple(source_node.get("localTransform"), source_world_transform)
     world_transform = _row_transform(target_row) if target_row is not None else multiply_transforms(parent_world_transform, source_local_transform)
@@ -485,13 +538,15 @@ def _clone_native_source_node(
     )
     source_children = source_node.get("children")
     target_children = target_children_by_parent.get(occurrence_id, []) if occurrence_id else []
-    if target_children and not _source_node_has_children(source_node) and _source_node_has_glb_asset(source_node):
+    if target_children and not _source_node_has_children(source_node):
         return _native_source_part_node(
             source_node=source_node,
             target_row=target_row,
-            topology_path=topology_path,
-            source_topology_path=source_topology_path,
             occurrence_id=occurrence_id,
+            source_path=source_path,
+            source_occurrence_id=source_occurrence_id,
+            source_root_occurrence_id=source_root_occurrence_id,
+            source_root_target_occurrence_id=next_source_root_target_occurrence_id,
             display_name=_occurrence_display_name(target_row) if target_row is not None else "",
             instance_path=".".join(
                 part
@@ -514,6 +569,8 @@ def _clone_native_source_node(
             topology_path=topology_path,
             source_topology_path=source_topology_path,
             source_root_occurrence_id=source_root_occurrence_id,
+            source_path=source_path,
+            source_root_target_occurrence_id=next_source_root_target_occurrence_id,
             target_parent_occurrence_id=target_parent_occurrence_id,
             parent_world_transform=world_transform,
             parent_instance_path=parent_instance_path,
@@ -530,6 +587,8 @@ def _clone_native_source_node(
                 topology_path=topology_path,
                 source_topology_path=source_topology_path,
                 source_root_occurrence_id=source_root_occurrence_id,
+                source_path=source_path,
+                source_root_target_occurrence_id=next_source_root_target_occurrence_id,
                 target_parent_occurrence_id=occurrence_id,
                 parent_world_transform=world_transform,
                 parent_instance_path=parent_instance_path,
@@ -556,12 +615,12 @@ def _clone_native_source_node(
     use_source_colors = parent_use_source_colors and source_node.get("useSourceColors") is not False
     if node_children:
         child_counts = _sum_public_counts(node_children)
-        return _assembly_node(
+        node = _assembly_node(
             id=occurrence_id,
             occurrence_id=occurrence_id,
             display_name=display_name,
             source_kind="native",
-            source_path="",
+            source_path=source_path,
             instance_path=instance_path,
             use_source_colors=use_source_colors,
             local_transform=local_transform,
@@ -570,13 +629,22 @@ def _clone_native_source_node(
             topology_counts=child_counts if _counts_have_values(child_counts) else _public_topology_counts(topology_counts),
             children=node_children,
         )
+        _attach_native_source_metadata(
+            node,
+            source_occurrence_id=source_occurrence_id,
+            source_root_occurrence_id=source_root_occurrence_id,
+            source_root_target_occurrence_id=next_source_root_target_occurrence_id,
+        )
+        return node
 
     return _native_source_part_node(
         source_node=source_node,
         target_row=target_row,
-        topology_path=topology_path,
-        source_topology_path=source_topology_path,
         occurrence_id=occurrence_id,
+        source_path=source_path,
+        source_occurrence_id=source_occurrence_id,
+        source_root_occurrence_id=source_root_occurrence_id,
+        source_root_target_occurrence_id=next_source_root_target_occurrence_id,
         display_name=display_name,
         instance_path=instance_path,
         use_source_colors=use_source_colors,
@@ -591,21 +659,10 @@ def _source_node_has_children(source_node: Mapping[str, Any]) -> bool:
     return isinstance(source_children, list) and bool(source_children)
 
 
-def _source_node_glb_asset(source_node: Mapping[str, Any]) -> Mapping[str, Any]:
-    glb_asset = source_node.get("assets", {}).get("glb") if isinstance(source_node.get("assets"), Mapping) else {}
-    return glb_asset if isinstance(glb_asset, Mapping) else {}
-
-
-def _source_node_has_glb_asset(source_node: Mapping[str, Any]) -> bool:
-    return bool(str(_source_node_glb_asset(source_node).get("url") or "").strip())
-
-
 def _native_source_part_node(
     *,
     source_node: Mapping[str, Any],
     target_row: Mapping[str, Any] | None,
-    topology_path: Path,
-    source_topology_path: Path,
     occurrence_id: str,
     display_name: str,
     instance_path: str,
@@ -613,30 +670,51 @@ def _native_source_part_node(
     local_transform: Sequence[float],
     world_transform: Sequence[float],
     bbox: Any,
+    source_path: str = "",
+    source_occurrence_id: str = "",
+    source_root_occurrence_id: str = "",
+    source_root_target_occurrence_id: str = "",
 ) -> dict[str, Any]:
-    glb_asset = _source_node_glb_asset(source_node)
-    asset_hash = str(glb_asset.get("hash") or "").strip() if isinstance(glb_asset, Mapping) else ""
-    asset_url = _relocated_asset_url(topology_path, source_topology_path, str(glb_asset.get("url") or "")) if isinstance(glb_asset, Mapping) else ""
     topology_counts = (
         _occurrence_topology_counts(target_row)
         if target_row is not None
         else source_node.get("topologyCounts") if isinstance(source_node.get("topologyCounts"), Mapping) else {}
     )
-    return _part_node(
+    node = _part_node(
         id=occurrence_id,
         occurrence_id=occurrence_id,
         display_name=display_name,
         source_kind="native",
-        source_path="",
+        source_path=source_path,
         instance_path=instance_path,
         use_source_colors=use_source_colors,
         local_transform=local_transform,
         world_transform=world_transform,
         bbox=bbox,
         topology_counts=_public_topology_counts(topology_counts),
-        asset_url=asset_url,
-        asset_hash=asset_hash,
     )
+    _attach_native_source_metadata(
+        node,
+        source_occurrence_id=source_occurrence_id,
+        source_root_occurrence_id=source_root_occurrence_id,
+        source_root_target_occurrence_id=source_root_target_occurrence_id,
+    )
+    return node
+
+
+def _attach_native_source_metadata(
+    node: dict[str, Any],
+    *,
+    source_occurrence_id: str,
+    source_root_occurrence_id: str,
+    source_root_target_occurrence_id: str,
+) -> None:
+    if source_occurrence_id:
+        node["sourceOccurrenceId"] = source_occurrence_id
+    if source_root_occurrence_id:
+        node["sourceRootOccurrenceId"] = source_root_occurrence_id
+    if source_root_target_occurrence_id:
+        node["sourceRootTargetOccurrenceId"] = source_root_target_occurrence_id
 
 
 def _prefix_native_occurrence_id(
@@ -652,17 +730,6 @@ def _prefix_native_occurrence_id(
         return f"{target_parent_occurrence_id}.{source_occurrence_id[len(prefix):]}"
     suffix = source_occurrence_id[1:] if source_occurrence_id.startswith("o") else source_occurrence_id
     return f"{target_parent_occurrence_id}.{suffix}" if suffix else target_parent_occurrence_id
-
-
-def _relocated_asset_url(topology_path: Path, source_topology_path: Path, raw_url: str) -> str:
-    if not raw_url:
-        return ""
-    asset_path, separator, query = raw_url.partition("?")
-    if not asset_path:
-        return ""
-    target_path = (source_topology_path.parent / asset_path).resolve()
-    relocated = _relative_to_topology(topology_path, target_path)
-    return f"{relocated}{separator}{query}" if separator else relocated
 
 
 def _children_by_parent(occurrences: Sequence[dict[str, Any]]) -> dict[str, list[dict[str, Any]]]:
@@ -754,7 +821,6 @@ def _native_occurrence_node(
     row: dict[str, Any],
     *,
     children_by_parent: Mapping[str, list[dict[str, Any]]],
-    component_mesh_paths: Mapping[str, Path],
     topology_path: Path,
     parent_world_transform: tuple[float, ...],
 ) -> dict[str, Any]:
@@ -763,7 +829,6 @@ def _native_occurrence_node(
     if not children:
         return _native_part_node(
             row,
-            component_mesh_paths=component_mesh_paths,
             topology_path=topology_path,
             parent_world_transform=parent_world_transform,
         )
@@ -772,7 +837,6 @@ def _native_occurrence_node(
         _native_occurrence_node(
             child,
             children_by_parent=children_by_parent,
-            component_mesh_paths=component_mesh_paths,
             topology_path=topology_path,
             parent_world_transform=world_transform,
         )
@@ -797,17 +861,12 @@ def _native_occurrence_node(
 def _native_part_node(
     row: dict[str, Any],
     *,
-    component_mesh_paths: Mapping[str, Path],
     topology_path: Path,
     parent_world_transform: tuple[float, ...],
 ) -> dict[str, Any]:
     occurrence_id = str(row.get("id") or "").strip()
     if not occurrence_id:
         raise AssemblyCompositionError("Native assembly occurrence is missing an id")
-    mesh_path = component_mesh_paths.get(occurrence_id)
-    if mesh_path is None:
-        raise AssemblyCompositionError(f"Native assembly component {occurrence_id} is missing a mesh asset")
-    mesh_hash = sha256_file(mesh_path) if mesh_path.exists() else ""
     world_transform = _row_transform(row)
     return _part_node(
         id=occurrence_id,
@@ -821,8 +880,6 @@ def _native_part_node(
         world_transform=world_transform,
         bbox=row.get("bbox"),
         topology_counts=_public_topology_counts(_occurrence_topology_counts(row)),
-        asset_url=_versioned_relative_url(topology_path, mesh_path, mesh_hash) if mesh_hash else "",
-        asset_hash=mesh_hash,
     )
 
 
@@ -839,10 +896,10 @@ def _part_node(
     world_transform: Sequence[float],
     bbox: Any,
     topology_counts: Mapping[str, int],
-    asset_url: str,
-    asset_hash: str,
+    asset_url: str = "",
+    asset_hash: str = "",
 ) -> dict[str, Any]:
-    return {
+    node = {
         "id": id,
         "occurrenceId": occurrence_id,
         "nodeType": "part",
@@ -855,15 +912,17 @@ def _part_node(
         "worldTransform": _transform_list(world_transform),
         "bbox": bbox,
         "topologyCounts": _public_topology_counts(topology_counts),
-        "assets": {
+        "leafPartIds": [id],
+        "children": [],
+    }
+    if asset_url:
+        node["assets"] = {
             "glb": {
                 "url": asset_url,
                 "hash": asset_hash,
             }
-        },
-        "leafPartIds": [id],
-        "children": [],
-    }
+        }
+    return node
 
 
 def _assembly_node(
@@ -1016,7 +1075,11 @@ def _read_json(path: Path) -> dict[str, Any]:
 
 
 def _source_topology_counts(topology_manifest_path: Path) -> dict[str, int]:
-    manifest = _read_json(topology_manifest_path)
+    manifest = read_step_topology_manifest_from_glb(topology_manifest_path)
+    if manifest is None:
+        raise AssemblyCompositionError(
+            f"Source GLB topology is missing: {relative_to_repo(topology_manifest_path)}"
+        )
     stats = manifest.get("stats")
     if not isinstance(stats, dict):
         raise AssemblyCompositionError(
@@ -1026,7 +1089,6 @@ def _source_topology_counts(topology_manifest_path: Path) -> dict[str, int]:
         "shapes": int(stats.get("shapeCount") or 0),
         "faces": int(stats.get("faceCount") or 0),
         "edges": int(stats.get("edgeCount") or 0),
-        "vertices": int(stats.get("vertexCount") or 0),
     }
     if any(value <= 0 for value in counts.values()):
         raise AssemblyCompositionError(
@@ -1040,7 +1102,6 @@ def _occurrence_topology_counts(occurrence: Mapping[str, Any]) -> dict[str, int]
         "shapes": int(occurrence.get("shapeCount") or 0),
         "faces": int(occurrence.get("faceCount") or 0),
         "edges": int(occurrence.get("edgeCount") or 0),
-        "vertices": int(occurrence.get("vertexCount") or 0),
     }
 
 
@@ -1049,12 +1110,11 @@ def _public_topology_counts(counts: Mapping[str, int]) -> dict[str, int]:
         "shapes": int(counts.get("shapes") or 0),
         "faces": int(counts.get("faces") or 0),
         "edges": int(counts.get("edges") or 0),
-        "vertices": int(counts.get("vertices") or 0),
     }
 
 
 def _sum_public_counts(children: Sequence[Mapping[str, Any]]) -> dict[str, int]:
-    total = {"shapes": 0, "faces": 0, "edges": 0, "vertices": 0}
+    total = {"shapes": 0, "faces": 0, "edges": 0}
     for child in children:
         counts = child.get("topologyCounts")
         if not isinstance(counts, Mapping):
@@ -1065,7 +1125,7 @@ def _sum_public_counts(children: Sequence[Mapping[str, Any]]) -> dict[str, int]:
 
 
 def _counts_have_values(counts: Mapping[str, int]) -> bool:
-    return any(int(counts.get(key) or 0) > 0 for key in ("shapes", "faces", "edges", "vertices"))
+    return any(int(counts.get(key) or 0) > 0 for key in ("shapes", "faces", "edges"))
 
 
 def _occurrence_display_name(row: Mapping[str, Any]) -> str:

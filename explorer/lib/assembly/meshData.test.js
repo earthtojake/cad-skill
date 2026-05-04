@@ -3,9 +3,8 @@ import { test } from "node:test";
 
 import {
   assemblyBreadcrumb,
-  assemblyCompositionMeshRequests,
   buildAssemblyLeafToNodePickMap,
-  buildAssemblyMeshData,
+  buildSelfContainedAssemblyMeshData,
   descendantLeafPartIds,
   findAssemblyNode,
   flattenAssemblyNodes,
@@ -14,26 +13,14 @@ import {
   representativeAssemblyLeafPartId
 } from "./meshData.js";
 
-test("buildAssemblyMeshData composes source meshes with assembly transforms", () => {
-  const sourceMesh = {
-    vertices: new Float32Array([
-      0, 0, 0,
-      1, 0, 0,
-      0, 1, 0
-    ]),
-    normals: new Float32Array([
-      0, 0, 1,
-      0, 0, 1,
-      0, 0, 1
-    ]),
-    indices: new Uint32Array([0, 1, 2]),
-    bounds: {
-      min: [0, 0, 0],
-      max: [1, 1, 0]
-    }
-  };
+test("self-contained assembly mesh data maps GLB node parts by occurrence id", () => {
   const topology = {
     assembly: {
+      mesh: {
+        url: ".assembly.step.glb?v=abc",
+        addressing: "gltf-node-extras",
+        occurrenceIdKey: "cadOccurrenceId"
+      },
       root: {
         id: "root",
         nodeType: "assembly",
@@ -50,235 +37,170 @@ test("buildAssemblyMeshData composes source meshes with assembly transforms", ()
               0, 0, 1, 30,
               0, 0, 0, 1
             ],
+            bbox: {
+              min: [10, 20, 30],
+              max: [11, 21, 30]
+            },
             children: []
           }
         ]
       }
     }
   };
+  const parsedGlbMeshData = {
+    vertices: new Float32Array([
+      10, 20, 30,
+      11, 20, 30,
+      10, 21, 30
+    ]),
+    normals: new Float32Array([
+      0, 0, 1,
+      0, 0, 1,
+      0, 0, 1
+    ]),
+    indices: new Uint32Array([0, 1, 2]),
+    colors: new Float32Array(0),
+    edge_indices: new Uint32Array(0),
+    bounds: {
+      min: [10, 20, 30],
+      max: [11, 21, 30]
+    },
+    parts: [
+      {
+        id: "o1.2",
+        occurrenceId: "o1.2",
+        vertexOffset: 0,
+        vertexCount: 3,
+        triangleOffset: 0,
+        triangleCount: 1,
+        bounds: {
+          min: [10, 20, 30],
+          max: [11, 21, 30]
+        }
+      }
+    ]
+  };
 
-  const meshData = buildAssemblyMeshData(
-    topology,
-    new Map([["parts/sample_part.step", sourceMesh]])
-  );
+  const meshData = buildSelfContainedAssemblyMeshData(topology, parsedGlbMeshData);
 
+  assert.equal(meshData.parts.length, 1);
+  assert.equal(meshData.parts[0].id, "o1.2");
+  assert.equal(meshData.parts[0].label, "sample_part");
+  assert.equal(meshData.parts[0].partSourcePath, "parts/sample_part.step");
+  assert.equal(meshData.parts[0].vertexOffset, 0);
+  assert.deepEqual(meshData.parts[0].bounds, {
+    min: [10, 20, 30],
+    max: [11, 21, 30]
+  });
   assert.deepEqual(Array.from(meshData.vertices), [
     10, 20, 30,
     11, 20, 30,
     10, 21, 30
   ]);
-  assert.deepEqual(Array.from(meshData.indices), [0, 1, 2]);
-  assert.equal(meshData.parts.length, 1);
-  assert.equal(meshData.parts[0].id, "o1.2");
-  assert.equal(meshData.parts[0].partSourcePath, "parts/sample_part.step");
-  assert.deepEqual(meshData.parts[0].bounds, {
-    min: [10, 20, 30],
-    max: [11, 21, 30]
-  });
 });
 
-test("buildAssemblyMeshData can suppress source colors per assembly part", () => {
-  const coloredMesh = {
+test("self-contained assembly mesh data groups descendant GLB nodes under topology leaves", () => {
+  const topology = {
+    assembly: {
+      mesh: {
+        url: ".assembly.step.glb?v=abc",
+        addressing: "gltf-node-extras",
+        occurrenceIdKey: "cadOccurrenceId"
+      },
+      root: {
+        id: "root",
+        nodeType: "assembly",
+        children: [
+          {
+            id: "o1.2",
+            occurrenceId: "o1.2",
+            nodeType: "part",
+            displayName: "compound_part",
+            children: []
+          }
+        ]
+      }
+    }
+  };
+  const parsedGlbMeshData = {
     vertices: new Float32Array([
       0, 0, 0,
       1, 0, 0,
-      0, 1, 0
+      0, 1, 0,
+      10, 0, 0,
+      11, 0, 0,
+      10, 1, 0
     ]),
     normals: new Float32Array([
       0, 0, 1,
       0, 0, 1,
-      0, 0, 1
-    ]),
-    colors: new Float32Array([
-      0.25, 0.5, 0.75,
-      0.25, 0.5, 0.75,
-      0.25, 0.5, 0.75
-    ]),
-    indices: new Uint32Array([0, 1, 2]),
-    bounds: {
-      min: [0, 0, 0],
-      max: [1, 1, 0]
-    },
-    has_source_colors: true
-  };
-  const topology = {
-    assembly: {
-      root: {
-        id: "root",
-        nodeType: "assembly",
-        children: [
-          {
-            id: "default_part",
-            occurrenceId: "default_part",
-            nodeType: "part",
-            sourcePath: "parts/default.step",
-            useSourceColors: false,
-            children: []
-          },
-          {
-            id: "colored_part",
-            occurrenceId: "colored_part",
-            nodeType: "part",
-            sourcePath: "parts/colored.step",
-            children: []
-          }
-        ]
-      }
-    }
-  };
-
-  const meshData = buildAssemblyMeshData(
-    topology,
-    new Map([
-      ["parts/default.step", coloredMesh],
-      ["parts/colored.step", coloredMesh]
-    ])
-  );
-
-  assert.equal(meshData.has_source_colors, true);
-  assert.equal(meshData.parts[0].hasSourceColors, false);
-  assert.equal(meshData.parts[1].hasSourceColors, true);
-  assert.deepEqual(Array.from(meshData.colors.slice(0, 9)), [1, 1, 1, 1, 1, 1, 1, 1, 1]);
-  assert.deepEqual(Array.from(meshData.colors.slice(9, 18)), [0.25, 0.5, 0.75, 0.25, 0.5, 0.75, 0.25, 0.5, 0.75]);
-});
-
-test("assemblyCompositionMeshRequests supports native component meshes", () => {
-  const topology = {
-    assembly: {
-      root: {
-        id: "root",
-        nodeType: "assembly",
-        children: [
-          {
-            id: "o1.1",
-            occurrenceId: "o1.1",
-            nodeType: "part",
-            assets: {
-              glb: {
-                url: "/workspace/imports/.assembly.step/components/o1.1.glb?v=abc",
-                hash: "abc"
-              }
-            },
-            children: []
-          },
-          {
-            id: "o1.2",
-            nodeType: "part",
-            sourcePath: "parts/sample_part.step",
-            children: []
-          }
-        ]
-      }
-    }
-  };
-
-  assert.deepEqual(assemblyCompositionMeshRequests(topology), [
-    {
-      key: "o1.1",
-      sourcePath: "",
-      meshUrl: "/workspace/imports/.assembly.step/components/o1.1.glb?v=abc"
-    },
-    {
-      key: "parts/sample_part.step",
-      sourcePath: "parts/sample_part.step",
-      meshUrl: ""
-    }
-  ]);
-});
-
-test("assemblyCompositionMeshRequests de-duplicates repeated source meshes", () => {
-  const topology = {
-    assembly: {
-      root: {
-        id: "root",
-        nodeType: "assembly",
-        children: [
-          {
-            id: "o1.1",
-            nodeType: "part",
-            sourcePath: "parts/reused.step",
-            children: []
-          },
-          {
-            id: "o1.2",
-            nodeType: "part",
-            sourcePath: "parts/reused.step",
-            assets: {
-              glb: {
-                url: "components/reused.glb?v=abc"
-              }
-            },
-            children: []
-          }
-        ]
-      }
-    }
-  };
-
-  assert.deepEqual(assemblyCompositionMeshRequests(topology), [
-    {
-      key: "parts/reused.step",
-      sourcePath: "parts/reused.step",
-      meshUrl: "components/reused.glb?v=abc"
-    }
-  ]);
-});
-
-test("buildAssemblyMeshData composes native component meshes by occurrence id", () => {
-  const sourceMesh = {
-    vertices: new Float32Array([
-      0, 0, 0,
-      2, 0, 0,
-      0, 2, 0
-    ]),
-    normals: new Float32Array([
+      0, 0, 1,
       0, 0, 1,
       0, 0, 1,
       0, 0, 1
     ]),
-    indices: new Uint32Array([0, 1, 2]),
+    indices: new Uint32Array([0, 1, 2, 3, 4, 5]),
+    colors: new Float32Array(0),
+    edge_indices: new Uint32Array(0),
     bounds: {
       min: [0, 0, 0],
-      max: [2, 2, 0]
-    }
-  };
-  const topology = {
-    assembly: {
-      mode: "native",
-      root: {
-        id: "root",
-        nodeType: "assembly",
-        children: [
-          {
-            id: "o1.1",
-            occurrenceId: "o1.1",
-            nodeType: "part",
-            displayName: "sample_component",
-            worldTransform: [
-              1, 0, 0, 3,
-              0, 1, 0, 4,
-              0, 0, 1, 5,
-              0, 0, 0, 1
-            ],
-            children: []
-          }
-        ]
+      max: [11, 1, 0]
+    },
+    parts: [
+      {
+        id: "o1.2.1",
+        occurrenceId: "o1.2.1",
+        vertexOffset: 0,
+        vertexCount: 3,
+        triangleOffset: 0,
+        triangleCount: 1,
+        primitiveIndex: 0,
+        bounds: {
+          min: [0, 0, 0],
+          max: [1, 1, 0]
+        }
+      },
+      {
+        id: "o1.2.2",
+        occurrenceId: "o1.2.2",
+        vertexOffset: 3,
+        vertexCount: 3,
+        triangleOffset: 1,
+        triangleCount: 1,
+        primitiveIndex: 2,
+        bounds: {
+          min: [10, 0, 0],
+          max: [11, 1, 0]
+        }
       }
-    }
+    ]
   };
 
-  const meshData = buildAssemblyMeshData(
-    topology,
-    new Map([["o1.1", sourceMesh]])
-  );
+  const meshData = buildSelfContainedAssemblyMeshData(topology, parsedGlbMeshData);
 
-  assert.deepEqual(Array.from(meshData.vertices), [
-    3, 4, 5,
-    5, 4, 5,
-    3, 6, 5
+  assert.equal(meshData.parts.length, 1);
+  assert.equal(meshData.parts[0].id, "o1.2");
+  assert.equal(meshData.parts[0].vertexCount, 6);
+  assert.equal(meshData.parts[0].triangleCount, 2);
+  assert.deepEqual(meshData.parts[0].sourcePartRanges, [
+    {
+      occurrenceId: "o1.2.1",
+      primitiveIndex: 0,
+      triangleOffset: 0,
+      triangleCount: 1
+    },
+    {
+      occurrenceId: "o1.2.2",
+      primitiveIndex: 2,
+      triangleOffset: 1,
+      triangleCount: 1
+    }
   ]);
-  assert.equal(meshData.parts[0].partSourcePath, "");
-  assert.equal(meshData.parts[0].label, "sample_component");
+  assert.deepEqual(Array.from(meshData.indices), [0, 1, 2, 3, 4, 5]);
+  assert.deepEqual(meshData.parts[0].sourceBounds, {
+    min: [0, 0, 0],
+    max: [11, 1, 0]
+  });
 });
 
 test("assembly helpers navigate nested assemblies down to leaf parts", () => {
@@ -311,7 +233,7 @@ test("assembly helpers navigate nested assemblies down to leaf parts", () => {
   assert.equal(representativeAssemblyLeafPartId(root.children[0]), "sample_part");
 });
 
-test("assembly mesh requests and picking maps use only descendant leaves", () => {
+test("assembly picking maps use only descendant leaves", () => {
   const root = {
     id: "root",
     nodeType: "assembly",
@@ -333,35 +255,13 @@ test("assembly mesh requests and picking maps use only descendant leaves", () =>
             id: "leaf_b",
             occurrenceId: "o1.1.2",
             nodeType: "part",
-            assets: {
-              glb: {
-                url: "components/o1.1.2.glb?v=abc"
-              }
-            },
             children: []
           }
         ]
       }
     ]
   };
-  const topology = {
-    assembly: {
-      root
-    }
-  };
 
-  assert.deepEqual(assemblyCompositionMeshRequests(topology), [
-    {
-      key: "parts/a.step",
-      sourcePath: "parts/a.step",
-      meshUrl: ""
-    },
-    {
-      key: "leaf_b",
-      sourcePath: "",
-      meshUrl: "components/o1.1.2.glb?v=abc"
-    }
-  ]);
   assert.deepEqual(
     [...buildAssemblyLeafToNodePickMap(root.children).entries()],
     [

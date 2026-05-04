@@ -1,6 +1,6 @@
 "use client";
 
-import { forwardRef, useEffect, useImperativeHandle, useMemo, useRef, useState } from "react";
+import { forwardRef, useCallback, useEffect, useImperativeHandle, useMemo, useRef, useState } from "react";
 import { parseCadRefToken } from "../lib/cadRefs";
 import { copyImageBlobToClipboard } from "../lib/clipboard";
 import {
@@ -49,15 +49,18 @@ const DEFAULT_VIEW_PLANE_ORIENTATION = Object.freeze({
   z: [0, 0, 1]
 });
 const MODEL_FRAME_BUFFER = 1.08;
-const DEFAULT_VIEW_DIRECTION = [2.1, 1.08, 1.65];
+const WORLD_UP = Object.freeze([0, 0, 1]);
+const CAD_COORDINATE_SYSTEM = "cad-z-up-v1";
+const DEFAULT_VIEW_DIRECTION = [2.1, -1.65, 1.08];
 const VIEW_PLANE_DEFAULT_PRESET = {
   id: "isometric",
   title: "Reset to default isometric view",
   direction: DEFAULT_VIEW_DIRECTION,
-  up: [0, 1, 0]
+  up: WORLD_UP
 };
 const CAD_EDGE_OPACITY = 0.84;
 const CAD_EDGE_THRESHOLD_DEG = 16;
+const DERIVED_DISPLAY_EDGE_TRIANGLE_LIMIT = 500000;
 const DRAWING_STROKE_COLOR = "#ef4444";
 const DRAWING_STROKE_HALO = "rgba(255, 255, 255, 0.94)";
 const DRAWING_STROKE_WIDTH = 4;
@@ -174,46 +177,46 @@ const LOOK_BACKGROUND_TYPES = {
 const HEX_COLOR_PATTERN = /^#(?:[0-9a-fA-F]{3}){1,2}$/;
 const VIEW_PLANE_FACES = [
   {
-    id: "y",
-    label: "Y",
-    title: "Jump to top view",
-    direction: [0, 1, 0],
-    up: [0, 0, -1]
-  },
-  {
-    id: "yNeg",
-    label: "-Y",
-    title: "Jump to bottom view",
-    direction: [0, -1, 0],
-    up: [0, 0, 1]
-  },
-  {
     id: "z",
     label: "Z",
-    title: "Jump to front view",
+    title: "Jump to top view",
     direction: [0, 0, 1],
     up: [0, 1, 0]
   },
   {
     id: "zNeg",
     label: "-Z",
-    title: "Jump to back view",
+    title: "Jump to bottom view",
     direction: [0, 0, -1],
     up: [0, 1, 0]
+  },
+  {
+    id: "yNeg",
+    label: "-Y",
+    title: "Jump to front view",
+    direction: [0, -1, 0],
+    up: WORLD_UP
+  },
+  {
+    id: "y",
+    label: "Y",
+    title: "Jump to back view",
+    direction: [0, 1, 0],
+    up: WORLD_UP
   },
   {
     id: "x",
     label: "X",
     title: "Jump to right view",
     direction: [1, 0, 0],
-    up: [0, 1, 0]
+    up: WORLD_UP
   },
   {
     id: "xNeg",
     label: "-X",
     title: "Jump to left view",
     direction: [-1, 0, 0],
-    up: [0, 1, 0]
+    up: WORLD_UP
   }
 ];
 const VIEW_PLANE_FACE_BY_ID = Object.fromEntries(VIEW_PLANE_FACES.map((face) => [face.id, face]));
@@ -373,8 +376,8 @@ function normalizeLookSettingsShape(lookSettings = {}) {
         intensity: Number.isFinite(Number(lighting?.directional?.intensity)) ? Number(lighting.directional.intensity) : 1,
         position: {
           x: Number.isFinite(Number(lighting?.directional?.position?.x)) ? Number(lighting.directional.position.x) : 140,
-          y: Number.isFinite(Number(lighting?.directional?.position?.y)) ? Number(lighting.directional.position.y) : 220,
-          z: Number.isFinite(Number(lighting?.directional?.position?.z)) ? Number(lighting.directional.position.z) : 140
+          y: Number.isFinite(Number(lighting?.directional?.position?.y)) ? Number(lighting.directional.position.y) : -120,
+          z: Number.isFinite(Number(lighting?.directional?.position?.z)) ? Number(lighting.directional.position.z) : 220
         }
       },
       spot: {
@@ -385,8 +388,8 @@ function normalizeLookSettingsShape(lookSettings = {}) {
         distance: Number.isFinite(Number(lighting?.spot?.distance)) ? Number(lighting.spot.distance) : 0,
         position: {
           x: Number.isFinite(Number(lighting?.spot?.position?.x)) ? Number(lighting.spot.position.x) : 160,
-          y: Number.isFinite(Number(lighting?.spot?.position?.y)) ? Number(lighting.spot.position.y) : 120,
-          z: Number.isFinite(Number(lighting?.spot?.position?.z)) ? Number(lighting.spot.position.z) : 100
+          y: Number.isFinite(Number(lighting?.spot?.position?.y)) ? Number(lighting.spot.position.y) : -120,
+          z: Number.isFinite(Number(lighting?.spot?.position?.z)) ? Number(lighting.spot.position.z) : 140
         }
       },
       point: {
@@ -396,8 +399,8 @@ function normalizeLookSettingsShape(lookSettings = {}) {
         distance: Number.isFinite(Number(lighting?.point?.distance)) ? Number(lighting.point.distance) : 0,
         position: {
           x: Number.isFinite(Number(lighting?.point?.position?.x)) ? Number(lighting.point.position.x) : -120,
-          y: Number.isFinite(Number(lighting?.point?.position?.y)) ? Number(lighting.point.position.y) : 80,
-          z: Number.isFinite(Number(lighting?.point?.position?.z)) ? Number(lighting.point.position.z) : 140
+          y: Number.isFinite(Number(lighting?.point?.position?.y)) ? Number(lighting.point.position.y) : 140,
+          z: Number.isFinite(Number(lighting?.point?.position?.z)) ? Number(lighting.point.position.z) : 80
         }
       },
       ambient: {
@@ -706,7 +709,7 @@ function createStageFloorGlowTexture(THREE, color, opacity) {
   return texture;
 }
 
-function createStageFloorPlane(THREE, explorerTheme, lookSettings, size, floorY, lift = 0) {
+function createStageFloorPlane(THREE, explorerTheme, lookSettings, size, floorZ, lift = 0) {
   const glassFactor = resolveStageFloorGlassFactor(lookSettings);
   const horizonBlend = getStageFloorSetting(lookSettings, "horizonBlend", 0, 0, 1);
   const reflectivity = getStageFloorSetting(lookSettings, "reflectivity", 0.12, 0, 1);
@@ -762,8 +765,7 @@ function createStageFloorPlane(THREE, explorerTheme, lookSettings, size, floorY,
     envMapIntensity
   });
   const mesh = new THREE.Mesh(new THREE.PlaneGeometry(1, 1, 1, 1), material);
-  mesh.rotation.x = -Math.PI / 2;
-  mesh.position.set(0, floorY + lift, 0);
+  mesh.position.set(0, 0, floorZ + lift);
   mesh.scale.set(size, size, 1);
   mesh.receiveShadow = false;
   mesh.castShadow = false;
@@ -771,7 +773,7 @@ function createStageFloorPlane(THREE, explorerTheme, lookSettings, size, floorY,
   return mesh;
 }
 
-function createStageFloorGlowPlane(THREE, lookSettings, lightingScopeRadius, size, floorY, sceneScaleMode, lift = 0.008) {
+function createStageFloorGlowPlane(THREE, lookSettings, lightingScopeRadius, size, floorZ, sceneScaleMode, lift = 0.008) {
   const spotLight = lookSettings?.lighting?.spot || {};
   if (spotLight.enabled === false) {
     return null;
@@ -802,8 +804,7 @@ function createStageFloorGlowPlane(THREE, lookSettings, lightingScopeRadius, siz
     toneMapped: true
   });
   const mesh = new THREE.Mesh(new THREE.PlaneGeometry(1, 1, 1, 1), material);
-  mesh.rotation.x = -Math.PI / 2;
-  mesh.position.set(0, floorY + lift, 0);
+  mesh.position.set(0, 0, floorZ + lift);
   mesh.scale.set(glowSize * 1.45, glowSize, 1);
   mesh.receiveShadow = false;
   mesh.castShadow = false;
@@ -811,7 +812,7 @@ function createStageFloorGlowPlane(THREE, lookSettings, lightingScopeRadius, siz
   return mesh;
 }
 
-function createStageShadowPlane(THREE, lookSettings, size, floorY, lift = 0.01) {
+function createStageShadowPlane(THREE, lookSettings, size, floorZ, lift = 0.01) {
   const opacity = getStageFloorSetting(lookSettings, "shadowOpacity", 0.45, 0, 1);
   if (opacity <= 0.001) {
     return null;
@@ -823,8 +824,7 @@ function createStageShadowPlane(THREE, lookSettings, size, floorY, lift = 0.01) 
     depthWrite: false
   });
   const mesh = new THREE.Mesh(new THREE.PlaneGeometry(1, 1, 1, 1), material);
-  mesh.rotation.x = -Math.PI / 2;
-  mesh.position.set(0, floorY + lift, 0);
+  mesh.position.set(0, 0, floorZ + lift);
   mesh.scale.set(size, size, 1);
   mesh.receiveShadow = true;
   mesh.castShadow = false;
@@ -836,9 +836,9 @@ function updateSpotLightTarget(runtime) {
   if (!runtime?.spotLight?.target?.position) {
     return;
   }
-  const floorY = Number(runtime.gridFloorY);
-  const targetY = runtime.floorMode !== LOOK_FLOOR_MODES.NONE && Number.isFinite(floorY) ? floorY : 0;
-  runtime.spotLight.target.position.set(0, targetY, 0);
+  const floorZ = Number(runtime.gridFloorZ);
+  const targetZ = runtime.floorMode !== LOOK_FLOOR_MODES.NONE && Number.isFinite(floorZ) ? floorZ : 0;
+  runtime.spotLight.target.position.set(0, 0, targetZ);
   runtime.spotLight.target.updateMatrixWorld?.();
 }
 
@@ -848,7 +848,7 @@ function getStageFloorSize(radius, sceneScaleMode) {
   return Math.max(sceneScaleSettings.minGridSize * 80, safeRadius * 160);
 }
 
-function updateStageEffects(runtime, explorerTheme, lookSettings, radius, floorY = 0, floorMode = LOOK_FLOOR_MODES.STAGE) {
+function updateStageEffects(runtime, explorerTheme, lookSettings, radius, floorZ = 0, floorMode = LOOK_FLOOR_MODES.STAGE) {
   if (!runtime?.THREE || !runtime?.stageGroup) {
     return;
   }
@@ -861,19 +861,19 @@ function updateStageEffects(runtime, explorerTheme, lookSettings, radius, floorY
 
   const floorSize = getStageFloorSize(radius, runtime.sceneScaleMode);
   const lightingScopeRadius = getLightingScopeRadius(runtime.sceneScaleMode);
-  runtime.stageGroup.add(createStageFloorPlane(runtime.THREE, explorerTheme, lookSettings, floorSize, floorY, 0));
+  runtime.stageGroup.add(createStageFloorPlane(runtime.THREE, explorerTheme, lookSettings, floorSize, floorZ, 0));
   const glowPlane = createStageFloorGlowPlane(
     runtime.THREE,
     lookSettings,
     lightingScopeRadius,
     floorSize,
-    floorY,
+    floorZ,
     runtime.sceneScaleMode
   );
   if (glowPlane) {
     runtime.stageGroup.add(glowPlane);
   }
-  const shadowPlane = createStageShadowPlane(runtime.THREE, lookSettings, floorSize, floorY);
+  const shadowPlane = createStageShadowPlane(runtime.THREE, lookSettings, floorSize, floorZ);
   if (shadowPlane) {
     runtime.stageGroup.add(shadowPlane);
   }
@@ -995,7 +995,8 @@ function readPerspectiveSnapshot(runtime) {
 function readScopedPerspectiveSnapshot(runtime, { modelKey = "", sceneScaleMode = "" } = {}) {
   return annotatePerspectiveSnapshot(readPerspectiveSnapshot(runtime), {
     modelKey,
-    sceneScaleMode
+    sceneScaleMode,
+    coordinateSystem: CAD_COORDINATE_SYSTEM
   });
 }
 
@@ -1079,7 +1080,12 @@ function applyOrbitDelta(runtime, azimuthDelta, polarDelta) {
   }
 
   const offset = new runtime.THREE.Vector3().copy(runtime.camera.position).sub(runtime.controls.target);
-  const spherical = new runtime.THREE.Spherical().setFromVector3(offset);
+  const distance = offset.length();
+  if (!Number.isFinite(distance) || distance <= 1e-6) {
+    return false;
+  }
+  const worldUp = new runtime.THREE.Vector3(...WORLD_UP).normalize();
+  const direction = offset.clone().divideScalar(distance);
   const minPolar = Math.max(
     Number.isFinite(runtime.controls.minPolarAngle) ? runtime.controls.minPolarAngle : 0,
     KEYBOARD_POLAR_EPSILON
@@ -1088,15 +1094,30 @@ function applyOrbitDelta(runtime, azimuthDelta, polarDelta) {
     Number.isFinite(runtime.controls.maxPolarAngle) ? runtime.controls.maxPolarAngle : Math.PI,
     Math.PI - KEYBOARD_POLAR_EPSILON
   );
-  const nextTheta = spherical.theta + azimuthDelta;
+  const currentPolar = Math.acos(clamp(direction.dot(worldUp), -1, 1));
+  const requestedPolar = clamp(currentPolar + polarDelta, minPolar, maxPolar);
+  const resolvedPolarDelta = requestedPolar - currentPolar;
+
   const minAzimuth = Number.isFinite(runtime.controls.minAzimuthAngle) ? runtime.controls.minAzimuthAngle : -Infinity;
   const maxAzimuth = Number.isFinite(runtime.controls.maxAzimuthAngle) ? runtime.controls.maxAzimuthAngle : Infinity;
+  if (Number.isFinite(minAzimuth) || Number.isFinite(maxAzimuth)) {
+    const currentAzimuth = Math.atan2(offset.y, offset.x);
+    const nextAzimuth = clamp(normalizeAngleAround(currentAzimuth + azimuthDelta, currentAzimuth), minAzimuth, maxAzimuth);
+    azimuthDelta = nextAzimuth - currentAzimuth;
+  }
 
-  spherical.theta = clamp(normalizeAngleAround(nextTheta, spherical.theta), minAzimuth, maxAzimuth);
-  spherical.phi = clamp(spherical.phi + polarDelta, minPolar, maxPolar);
-  spherical.makeSafe();
-  offset.setFromSpherical(spherical);
+  if (Math.abs(azimuthDelta) > 1e-6) {
+    offset.applyAxisAngle(worldUp, azimuthDelta);
+  }
+  if (Math.abs(resolvedPolarDelta) > 1e-6) {
+    let orbitRight = new runtime.THREE.Vector3().crossVectors(worldUp, offset).normalize();
+    if (orbitRight.lengthSq() <= 1e-9) {
+      orbitRight = new runtime.THREE.Vector3(1, 0, 0);
+    }
+    offset.applyAxisAngle(orbitRight, resolvedPolarDelta);
+  }
   runtime.camera.position.copy(runtime.controls.target).add(offset);
+  runtime.camera.up.set(...WORLD_UP);
   runtime.camera.lookAt(runtime.controls.target);
   return true;
 }
@@ -2383,6 +2404,12 @@ function applyRuntimeModelBounds(THREE, runtime, bounds, sceneScaleMode) {
   };
 }
 
+function normalizePartIdList(value) {
+  return (Array.isArray(value) ? value : [value])
+    .map((id) => String(id || "").trim())
+    .filter(Boolean);
+}
+
 function applyPartVisualState(THREE, records, {
   explorerTheme,
   edgeSettings,
@@ -2403,11 +2430,7 @@ function applyPartVisualState(THREE, records, {
   const defaultSurfaceOpacity = Number.isFinite(Number(explorerTheme?.surfaceOpacity))
     ? Number(explorerTheme.surfaceOpacity)
     : 1;
-  const focusIds = new Set(
-    (Array.isArray(focusedPartId) ? focusedPartId : [focusedPartId])
-      .map((id) => String(id || "").trim())
-      .filter(Boolean)
-  );
+  const focusIds = new Set(normalizePartIdList(focusedPartId));
   const hasFocus = focusIds.size > 0;
   const baseEdgeOpacity = Number.isFinite(Number(edgeSettings?.opacity))
     ? clamp(Number(edgeSettings.opacity), 0, 1)
@@ -2949,6 +2972,14 @@ function buildEdgeGeometry(THREE, meshData, sourceGeometry) {
   return buildDisplayEdgeGeometry(THREE, sourceGeometry);
 }
 
+function shouldBuildDerivedDisplayEdges(meshData) {
+  if (isNumericArray(meshData?.edge_indices, 2)) {
+    return true;
+  }
+  const triangleCount = Math.floor((meshData?.indices?.length || 0) / 3);
+  return triangleCount <= DERIVED_DISPLAY_EDGE_TRIANGLE_LIMIT;
+}
+
 function buildEdgePickObjects(THREE, group, references) {
   const objects = [];
   for (const reference of Array.isArray(references) ? references : []) {
@@ -2997,6 +3028,146 @@ function buildFacePickMesh(THREE, selectorRuntime) {
   return mesh;
 }
 
+const TOPOLOGY_FACE_ID_NONE = 0xffffffff;
+
+function faceRunColumnIndexes(selectorRuntime) {
+  const columns = Array.isArray(selectorRuntime?.proxy?.faceRunColumns) && selectorRuntime.proxy.faceRunColumns.length
+    ? selectorRuntime.proxy.faceRunColumns
+    : ["occurrenceRow", "primitiveIndex", "triangleStart", "triangleCount", "faceRow"];
+  return {
+    stride: columns.length,
+    occurrenceRow: Math.max(0, columns.indexOf("occurrenceRow")),
+    primitiveIndex: Math.max(0, columns.indexOf("primitiveIndex")),
+    triangleStart: Math.max(0, columns.indexOf("triangleStart")),
+    triangleCount: Math.max(0, columns.indexOf("triangleCount")),
+    faceRow: Math.max(0, columns.indexOf("faceRow"))
+  };
+}
+
+function buildGlbFaceIdsForPart(part, selectorRuntime) {
+  const runs = selectorRuntime?.proxy?.faceRuns;
+  const triangleCount = Math.max(0, Math.floor(Number(part?.triangleCount || 0)));
+  if (!(runs instanceof Uint32Array) || !runs.length || triangleCount <= 0) {
+    return null;
+  }
+  const occurrenceId = String(part?.occurrenceId || part?.id || "").trim();
+  if (!occurrenceId) {
+    return null;
+  }
+  const primitiveIndex = Math.max(0, Math.floor(Number(part?.primitiveIndex || 0)));
+  const columns = faceRunColumnIndexes(selectorRuntime);
+  const faceIds = new Uint32Array(triangleCount);
+  faceIds.fill(TOPOLOGY_FACE_ID_NONE);
+  const sourcePartRanges = Array.isArray(part?.sourcePartRanges)
+    ? part.sourcePartRanges
+      .map((range) => ({
+        occurrenceId: String(range?.occurrenceId || "").trim(),
+        primitiveIndex: Math.max(0, Math.floor(Number(range?.primitiveIndex || 0))),
+        triangleOffset: Math.max(0, Math.floor(Number(range?.triangleOffset || 0))),
+        triangleCount: Math.max(0, Math.floor(Number(range?.triangleCount || 0)))
+      }))
+      .filter((range) => range.occurrenceId && range.triangleCount > 0)
+    : [];
+  let matched = false;
+  for (let offset = 0; offset + columns.stride <= runs.length; offset += columns.stride) {
+    const runOccurrenceId = selectorRuntime?.occurrenceIdByRowIndex?.get?.(Number(runs[offset + columns.occurrenceRow]));
+    const triangleStart = Number(runs[offset + columns.triangleStart]);
+    const runTriangleCount = Number(runs[offset + columns.triangleCount]);
+    const faceRow = Number(runs[offset + columns.faceRow]);
+    if (
+      !Number.isInteger(triangleStart) ||
+      !Number.isInteger(runTriangleCount) ||
+      !Number.isInteger(faceRow) ||
+      triangleStart < 0 ||
+      runTriangleCount <= 0 ||
+      faceRow < 0
+    ) {
+      continue;
+    }
+    if (sourcePartRanges.length) {
+      for (const range of sourcePartRanges) {
+        if (runOccurrenceId !== range.occurrenceId || Number(runs[offset + columns.primitiveIndex]) !== range.primitiveIndex) {
+          continue;
+        }
+        if (triangleStart >= range.triangleCount) {
+          continue;
+        }
+        const start = range.triangleOffset + triangleStart;
+        const end = Math.min(range.triangleOffset + triangleStart + runTriangleCount, range.triangleOffset + range.triangleCount, triangleCount);
+        if (end <= start || start >= triangleCount) {
+          continue;
+        }
+        faceIds.fill(faceRow, start, end);
+        matched = true;
+      }
+      continue;
+    }
+    if (runOccurrenceId !== occurrenceId || Number(runs[offset + columns.primitiveIndex]) !== primitiveIndex || triangleStart >= triangleCount) {
+      continue;
+    }
+    const end = Math.min(triangleStart + runTriangleCount, triangleCount);
+    faceIds.fill(faceRow, triangleStart, end);
+    matched = true;
+  }
+  return matched ? faceIds : null;
+}
+
+function buildGlbFaceIdsForMesh(meshData, selectorRuntime) {
+  const triangleCount = Math.floor((meshData?.indices?.length || 0) / 3);
+  const parts = Array.isArray(meshData?.parts) ? meshData.parts : [];
+  if (triangleCount <= 0 || !parts.length) {
+    return null;
+  }
+  const faceIds = new Uint32Array(triangleCount);
+  faceIds.fill(TOPOLOGY_FACE_ID_NONE);
+  let matched = false;
+  for (const part of parts) {
+    const partFaceIds = buildGlbFaceIdsForPart(part, selectorRuntime);
+    if (!partFaceIds) {
+      continue;
+    }
+    const triangleOffset = Math.max(0, Math.floor(Number(part?.triangleOffset || 0)));
+    const end = Math.min(triangleOffset + partFaceIds.length, faceIds.length);
+    if (end <= triangleOffset) {
+      continue;
+    }
+    faceIds.set(partFaceIds.subarray(0, end - triangleOffset), triangleOffset);
+    matched = true;
+  }
+  return matched ? faceIds : null;
+}
+
+function syncDisplayMeshFaceIds(runtime, meshData, selectorRuntime) {
+  const records = Array.isArray(runtime?.displayRecords) ? runtime.displayRecords : [];
+  if (!records.length) {
+    return;
+  }
+  const partsById = new Map(
+    (Array.isArray(meshData?.parts) ? meshData.parts : [])
+      .map((part) => [String(part?.id || ""), part])
+      .filter(([partId]) => partId)
+  );
+  for (const record of records) {
+    const mesh = record?.mesh;
+    if (!mesh?.userData) {
+      continue;
+    }
+    let faceIds = null;
+    const partId = String(record?.partId || "").trim();
+    if (partId && partId !== "__model__") {
+      const part = partsById.get(partId);
+      faceIds = part ? buildGlbFaceIdsForPart(part, selectorRuntime) : null;
+    } else {
+      faceIds = buildGlbFaceIdsForMesh(meshData, selectorRuntime);
+    }
+    if (faceIds) {
+      mesh.userData.faceIds = faceIds;
+    } else {
+      delete mesh.userData.faceIds;
+    }
+  }
+}
+
 function buildEdgePickLines(THREE, selectorRuntime) {
   const proxy = selectorRuntime?.proxy || {};
   if (!(proxy.edgePositions instanceof Float32Array) || !(proxy.edgeIndices instanceof Uint32Array) || !proxy.edgeIndices.length) {
@@ -3038,6 +3209,52 @@ function buildVertexPickPoints(THREE, selectorRuntime) {
   points.userData.vertexIds = proxy.vertexIds || new Uint32Array(0);
   points.frustumCulled = false;
   return points;
+}
+
+function syncSelectorPickGroups(runtime, selectorRuntime, modelOffset = null) {
+  if (!runtime?.THREE || !runtime?.facePickGroup || !runtime?.edgePickGroup || !runtime?.vertexPickGroup) {
+    return;
+  }
+
+  clearSceneGroup(runtime.facePickGroup);
+  clearSceneGroup(runtime.edgePickGroup);
+  clearSceneGroup(runtime.vertexPickGroup);
+  runtime.facePickMesh = null;
+  runtime.edgePickLines = null;
+  runtime.vertexPickPoints = null;
+  runtime.edgePickObjects = [];
+
+  const facePickMesh = buildFacePickMesh(runtime.THREE, selectorRuntime);
+  if (facePickMesh) {
+    runtime.facePickMesh = facePickMesh;
+    runtime.facePickGroup.add(facePickMesh);
+  }
+
+  const edgePickLines = buildEdgePickLines(runtime.THREE, selectorRuntime);
+  if (edgePickLines) {
+    runtime.edgePickLines = edgePickLines;
+    runtime.edgePickGroup.add(edgePickLines);
+    runtime.edgePickObjects = [edgePickLines];
+  }
+
+  const vertexPickPoints = buildVertexPickPoints(runtime.THREE, selectorRuntime);
+  if (vertexPickPoints) {
+    runtime.vertexPickPoints = vertexPickPoints;
+    runtime.vertexPickGroup.add(vertexPickPoints);
+  }
+
+  if (modelOffset) {
+    runtime.facePickGroup.position.copy(modelOffset);
+    runtime.edgePickGroup.position.copy(modelOffset);
+    runtime.vertexPickGroup.position.copy(modelOffset);
+  } else {
+    runtime.facePickGroup.position.set(0, 0, 0);
+    runtime.edgePickGroup.position.set(0, 0, 0);
+    runtime.vertexPickGroup.position.set(0, 0, 0);
+  }
+  runtime.facePickGroup.updateMatrixWorld(true);
+  runtime.edgePickGroup.updateMatrixWorld(true);
+  runtime.vertexPickGroup.updateMatrixWorld(true);
 }
 
 function faceFillOffset(runtime, reference) {
@@ -3101,6 +3318,44 @@ function buildFaceFillGeometryFromProxy(runtime, THREE, selectorRuntime, referen
   }
   const geometry = new THREE.BufferGeometry();
   geometry.setAttribute("position", new THREE.BufferAttribute(positions, 3));
+  return geometry;
+}
+
+function buildFaceFillGeometryFromDisplayMeshes(runtime, THREE, reference) {
+  const rowIndex = Number(reference?.rowIndex);
+  if (!Number.isInteger(rowIndex) || !Array.isArray(runtime?.displayRecords)) {
+    return null;
+  }
+  const offset = faceFillOffset(runtime, reference);
+  const vertex = new THREE.Vector3();
+  const fillPositions = [];
+  for (const record of runtime.displayRecords) {
+    const mesh = record?.mesh;
+    const geometry = mesh?.geometry;
+    const faceIds = mesh?.userData?.faceIds;
+    const positions = geometry?.getAttribute?.("position");
+    const indices = geometry?.getIndex?.();
+    if (!(faceIds instanceof Uint32Array) || !positions || !indices || !indices.count) {
+      continue;
+    }
+    const triangleCount = Math.min(faceIds.length, Math.floor(indices.count / 3));
+    for (let triangleIndex = 0; triangleIndex < triangleCount; triangleIndex += 1) {
+      if (Number(faceIds[triangleIndex]) !== rowIndex) {
+        continue;
+      }
+      for (let corner = 0; corner < 3; corner += 1) {
+        const sourceIndex = indices.getX((triangleIndex * 3) + corner);
+        vertex.set(positions.getX(sourceIndex), positions.getY(sourceIndex), positions.getZ(sourceIndex));
+        vertex.applyMatrix4(mesh.matrix);
+        fillPositions.push(vertex.x + offset[0], vertex.y + offset[1], vertex.z + offset[2]);
+      }
+    }
+  }
+  if (!fillPositions.length) {
+    return null;
+  }
+  const geometry = new THREE.BufferGeometry();
+  geometry.setAttribute("position", new THREE.BufferAttribute(new Float32Array(fillPositions), 3));
   return geometry;
 }
 
@@ -4412,7 +4667,7 @@ function updateGridHelper(
   runtime,
   explorerTheme,
   radius,
-  floorY = 0,
+  floorZ = 0,
   sceneScaleMode = EXPLORER_SCENE_SCALE.CAD,
   floorMode = LOOK_FLOOR_MODES.STAGE
 ) {
@@ -4420,7 +4675,7 @@ function updateGridHelper(
     return;
   }
   runtime.gridRadius = radius;
-  runtime.gridFloorY = floorY;
+  runtime.gridFloorZ = floorZ;
   runtime.floorMode = floorMode;
   if (floorMode !== LOOK_FLOOR_MODES.GRID) {
     disposeSceneObject(runtime.gridHelper);
@@ -4431,7 +4686,10 @@ function updateGridHelper(
   const nextConfig = buildGridConfig(radius, sceneScaleMode);
   const currentConfig = runtime.gridConfig;
   if (currentConfig && currentConfig.size === nextConfig.size && currentConfig.divisions === nextConfig.divisions) {
-    runtime.gridHelper?.position.set(0, floorY, 0);
+    if (runtime.gridHelper) {
+      runtime.gridHelper.rotation.x = Math.PI / 2;
+    }
+    runtime.gridHelper?.position.set(0, 0, floorZ);
     return;
   }
 
@@ -4451,7 +4709,8 @@ function updateGridHelper(
     material.depthWrite = false;
     material.toneMapped = false;
   }
-  runtime.gridHelper.position.set(0, floorY, 0);
+  runtime.gridHelper.rotation.x = Math.PI / 2;
+  runtime.gridHelper.position.set(0, 0, floorZ);
   runtime.scene.add(runtime.gridHelper);
   runtime.gridConfig = nextConfig;
 }
@@ -4535,8 +4794,10 @@ const CadExplorer = forwardRef(function CadExplorer({
     frameId: 0,
     playedIntroKey: ""
   });
+  const selectorRuntimeRef = useRef(selectorRuntime);
   const [error, setError] = useState("");
   const [explorerReadyTick, setExplorerReadyTick] = useState(0);
+  const [runtimeResetToken, setRuntimeResetToken] = useState(0);
   const [activeViewPlaneFace, setActiveViewPlaneFace] = useState("");
   const [viewPlaneOrientation, setViewPlaneOrientation] = useState(DEFAULT_VIEW_PLANE_ORIENTATION);
   const [urdfPosePickerGuidePoint, setUrdfPosePickerGuidePoint] = useState(null);
@@ -4545,10 +4806,13 @@ const CadExplorer = forwardRef(function CadExplorer({
   const previewModeRef = useRef(previewMode);
   const explorerTheme = theme || BASE_EXPLORER_THEME;
   const normalizedLookSettings = useMemo(() => normalizeLookSettingsShape(lookSettings), [lookSettings]);
+  const focusedPartIds = useMemo(() => normalizePartIdList(focusedPartId), [focusedPartId]);
+  const focusedPartIdSet = useMemo(() => new Set(focusedPartIds), [focusedPartIds]);
   const resolvedFloorMode = floorModeOverride
     ? normalizeFloorMode(floorModeOverride, resolveFloorMode(normalizedLookSettings.floor))
     : resolveFloorMode(normalizedLookSettings.floor);
   const edgesVisible = showEdges && normalizedLookSettings.edges.enabled;
+  const displayEdgesVisible = edgesVisible && shouldBuildDerivedDisplayEdges(meshData);
   const partVisualStateEnabled =
     pickMode === EXPLORER_PICK_MODE.PARTS ||
     pickMode === EXPLORER_PICK_MODE.ASSEMBLY ||
@@ -4557,15 +4821,15 @@ const CadExplorer = forwardRef(function CadExplorer({
       Array.isArray(pickableParts) &&
       pickableParts.length > 0
     ) ||
-    !!String(focusedPartId || "").trim();
+    focusedPartIds.length > 0;
   const partVisualStateRef = useRef({
     explorerTheme,
     edgeSettings: normalizedLookSettings.edges,
     hiddenPartIds: partVisualStateEnabled ? hiddenPartIds : [],
     hoveredPartId: partVisualStateEnabled ? hoveredPartId : "",
-    focusedPartId: partVisualStateEnabled ? focusedPartId : "",
+    focusedPartId: partVisualStateEnabled ? focusedPartIds : [],
     selectedPartIds: partVisualStateEnabled ? selectedPartIds : [],
-    showEdges: edgesVisible
+    showEdges: displayEdgesVisible
   });
 
   useEffect(() => {
@@ -4574,13 +4838,13 @@ const CadExplorer = forwardRef(function CadExplorer({
       edgeSettings: normalizedLookSettings.edges,
       hiddenPartIds: partVisualStateEnabled ? hiddenPartIds : [],
       hoveredPartId: partVisualStateEnabled ? hoveredPartId : "",
-      focusedPartId: partVisualStateEnabled ? focusedPartId : "",
+      focusedPartId: partVisualStateEnabled ? focusedPartIds : [],
       selectedPartIds: partVisualStateEnabled ? selectedPartIds : [],
-      showEdges: edgesVisible
+      showEdges: displayEdgesVisible
     };
   }, [
-    edgesVisible,
-    focusedPartId,
+    displayEdgesVisible,
+    focusedPartIds,
     hiddenPartIds,
     hoveredPartId,
     partVisualStateEnabled,
@@ -4588,23 +4852,22 @@ const CadExplorer = forwardRef(function CadExplorer({
     explorerTheme,
     normalizedLookSettings.edges
   ]);
-  const focusedPartIdValue = String(focusedPartId || "").trim();
   const activeSurfaceLineFaceId = String(surfaceLineFaceId || "").trim();
   const filteredPickableFaces = useMemo(() => (
-    focusedPartIdValue
-      ? (Array.isArray(pickableFaces) ? pickableFaces : []).filter((reference) => String(reference?.partId || "").trim() === focusedPartIdValue)
+    focusedPartIdSet.size
+      ? (Array.isArray(pickableFaces) ? pickableFaces : []).filter((reference) => focusedPartIdSet.has(String(reference?.partId || "").trim()))
       : (Array.isArray(pickableFaces) ? pickableFaces : [])
-  ), [focusedPartIdValue, pickableFaces]);
+  ), [focusedPartIdSet, pickableFaces]);
   const filteredPickableEdges = useMemo(() => (
-    focusedPartIdValue
-      ? (Array.isArray(pickableEdges) ? pickableEdges : []).filter((reference) => String(reference?.partId || "").trim() === focusedPartIdValue)
+    focusedPartIdSet.size
+      ? (Array.isArray(pickableEdges) ? pickableEdges : []).filter((reference) => focusedPartIdSet.has(String(reference?.partId || "").trim()))
       : (Array.isArray(pickableEdges) ? pickableEdges : [])
-  ), [focusedPartIdValue, pickableEdges]);
+  ), [focusedPartIdSet, pickableEdges]);
   const filteredPickableVertices = useMemo(() => (
-    focusedPartIdValue
-      ? (Array.isArray(pickableVertices) ? pickableVertices : []).filter((reference) => String(reference?.partId || "").trim() === focusedPartIdValue)
+    focusedPartIdSet.size
+      ? (Array.isArray(pickableVertices) ? pickableVertices : []).filter((reference) => focusedPartIdSet.has(String(reference?.partId || "").trim()))
       : (Array.isArray(pickableVertices) ? pickableVertices : [])
-  ), [focusedPartIdValue, pickableVertices]);
+  ), [focusedPartIdSet, pickableVertices]);
   const pickableReferenceMap = useMemo(() => {
     if (selectorRuntime?.referenceMap instanceof Map) {
       return selectorRuntime.referenceMap;
@@ -4696,7 +4959,7 @@ const CadExplorer = forwardRef(function CadExplorer({
   };
   const buildSurfaceLineFaceAnchor = (event, canvas, lockedReferenceId = "", startUv = null) => {
     const runtime = runtimeRef.current;
-    if (!runtime?.raycaster || !runtime?.camera || !runtime?.facePickMesh || !selectorRuntime?.faceReferenceByRowIndex) {
+    if (!runtime?.raycaster || !runtime?.camera || !selectorRuntime?.faceReferenceByRowIndex) {
       return null;
     }
     const activeLockedReferenceId = String(lockedReferenceId || activeSurfaceLineFaceId).trim();
@@ -4708,10 +4971,17 @@ const CadExplorer = forwardRef(function CadExplorer({
     runtime.pointer.y = -((event.clientY - rect.top) / height) * 2 + 1;
     runtime.raycaster.setFromCamera(runtime.pointer, runtime.camera);
 
-    const intersections = runtime.raycaster.intersectObject(runtime.facePickMesh, false);
-    for (const intersection of intersections) {
+    const modelMeshes = (runtime.displayRecords || [])
+      .map((record) => record?.mesh)
+      .filter((mesh) => mesh?.visible && mesh.userData?.faceIds instanceof Uint32Array);
+    const modelIntersections = modelMeshes.length ? runtime.raycaster.intersectObjects(modelMeshes, false) : [];
+    const proxyIntersections = runtime.facePickMesh ? runtime.raycaster.intersectObject(runtime.facePickMesh, false) : [];
+    const intersections = modelIntersections.length
+      ? modelIntersections.map((intersection) => ({ intersection, source: "model" }))
+      : proxyIntersections.map((intersection) => ({ intersection, source: "proxy" }));
+    for (const { intersection, source } of intersections) {
       const triangleIndex = Number(intersection?.faceIndex);
-      const rowIndex = Number.isInteger(triangleIndex) ? Number(runtime.facePickMesh.userData?.faceIds?.[triangleIndex]) : NaN;
+      const rowIndex = Number.isInteger(triangleIndex) ? Number(intersection?.object?.userData?.faceIds?.[triangleIndex]) : NaN;
       if (!Number.isInteger(rowIndex)) {
         continue;
       }
@@ -4732,7 +5002,9 @@ const CadExplorer = forwardRef(function CadExplorer({
       if (SURFACE_LINE_UNSUPPORTED_TYPES.has(String(surface.type || "").trim())) {
         return null;
       }
-      const localPoint = intersection.object.worldToLocal(intersection.point.clone());
+      const localPoint = source === "model" && runtime.modelGroup
+        ? runtime.modelGroup.worldToLocal(intersection.point.clone())
+        : intersection.object.worldToLocal(intersection.point.clone());
       const point = [localPoint.x, localPoint.y, localPoint.z];
       const angleCenter = surface.type === "CYLINDRICAL_SURFACE" && Array.isArray(startUv) ? (startUv[0] / Math.max(Number(surface.radius) || 1, 1)) : null;
       const uv = projectPointToSurfaceUv(surface, point, angleCenter);
@@ -5019,6 +5291,10 @@ const CadExplorer = forwardRef(function CadExplorer({
   }, [urdfPosePicker]);
 
   useEffect(() => {
+    selectorRuntimeRef.current = selectorRuntime;
+  }, [selectorRuntime]);
+
+  useEffect(() => {
     if (urdfPosePicker?.active) {
       return;
     }
@@ -5038,6 +5314,12 @@ const CadExplorer = forwardRef(function CadExplorer({
     drawingIdRef.current = Math.max(drawingIdRef.current, maxDrawingStrokeOrdinal(drawingStrokesRef.current));
     renderDrawingOverlay();
   }, [drawingStrokes]);
+
+  const handleRuntimeContextRestored = useCallback(() => {
+    framedModelKeyRef.current = "";
+    lastEmittedPerspectiveRef.current = null;
+    setRuntimeResetToken((value) => value + 1);
+  }, []);
 
   useExplorerRuntime({
     mountRef,
@@ -5084,7 +5366,9 @@ const CadExplorer = forwardRef(function CadExplorer({
     KEYBOARD_ORBIT_NUDGE_RAD,
     defaultGridRadius,
     sceneScaleMode: normalizedSceneScaleMode,
-    floorMode: resolvedFloorMode
+    floorMode: resolvedFloorMode,
+    onContextRestored: handleRuntimeContextRestored,
+    runtimeResetToken
   });
 
   useEffect(() => {
@@ -5173,7 +5457,7 @@ const CadExplorer = forwardRef(function CadExplorer({
       runtime,
       explorerTheme,
       runtime.gridRadius ?? defaultGridRadius,
-      runtime.gridFloorY ?? 0,
+      runtime.gridFloorZ ?? 0,
       normalizedSceneScaleMode,
       resolvedFloorMode
     );
@@ -5184,7 +5468,7 @@ const CadExplorer = forwardRef(function CadExplorer({
         explorerTheme,
         normalizedLookSettings,
         runtime.gridRadius ?? defaultGridRadius,
-        runtime.gridFloorY ?? 0,
+        runtime.gridFloorZ ?? 0,
         resolvedFloorMode
       );
     } else {
@@ -5355,7 +5639,8 @@ const CadExplorer = forwardRef(function CadExplorer({
       modelGroup,
       edgesGroup,
       facePickGroup,
-      edgePickGroup
+      edgePickGroup,
+      vertexPickGroup
     } = runtime;
 
     const clearDisplayedModel = () => {
@@ -5365,8 +5650,10 @@ const CadExplorer = forwardRef(function CadExplorer({
       clearSceneGroup(edgesGroup);
       clearSceneGroup(facePickGroup);
       clearSceneGroup(edgePickGroup);
+      clearSceneGroup(vertexPickGroup);
       runtime.facePickMesh = null;
       runtime.edgePickLines = null;
+      runtime.vertexPickPoints = null;
       runtime.edgePickObjects = [];
       runtime.displayRecords = [];
       runtime.hasVisibleModel = false;
@@ -5395,8 +5682,7 @@ const CadExplorer = forwardRef(function CadExplorer({
       (
         pickMode === EXPLORER_PICK_MODE.PARTS ||
         pickMode === EXPLORER_PICK_MODE.ASSEMBLY ||
-        pickMode === EXPLORER_PICK_MODE.AUTO ||
-        !!String(focusedPartId || "").trim()
+        pickMode === EXPLORER_PICK_MODE.AUTO
       );
     const renderedParts = renderPartsIndividually
       ? (Array.isArray(meshData?.parts) ? meshData.parts : [])
@@ -5432,13 +5718,17 @@ const CadExplorer = forwardRef(function CadExplorer({
         mesh.castShadow = true;
         mesh.receiveShadow = true;
         mesh.userData.partId = part.id;
+        const partFaceIds = buildGlbFaceIdsForPart(part, selectorRuntimeRef.current);
+        if (partFaceIds) {
+          mesh.userData.faceIds = partFaceIds;
+        }
         const displayPartTransform = renderPartsIndividually ? part?.transform : null;
         applyPartTransform(THREE, mesh, displayPartTransform);
         modelGroup.add(mesh);
 
         let edgeMaterial = null;
         let edgeMesh = null;
-        if (edgesVisible) {
+        if (displayEdgesVisible) {
           const edgeResult = createDisplayEdgeObject(
             runtime,
             buildPartEdgeGeometry(THREE, meshData, part, geometry),
@@ -5499,11 +5789,15 @@ const CadExplorer = forwardRef(function CadExplorer({
       mesh.castShadow = true;
       mesh.receiveShadow = true;
       mesh.userData.partId = "__model__";
+      const modelFaceIds = buildGlbFaceIdsForMesh(meshData, selectorRuntimeRef.current);
+      if (modelFaceIds) {
+        mesh.userData.faceIds = modelFaceIds;
+      }
       modelGroup.add(mesh);
 
       let edgeMaterial = null;
       let edgeMesh = null;
-      if (edgesVisible) {
+      if (displayEdgesVisible) {
         const edgeResult = createDisplayEdgeObject(
           runtime,
           buildEdgeGeometry(THREE, meshData, geometry),
@@ -5562,29 +5856,33 @@ const CadExplorer = forwardRef(function CadExplorer({
       runtime,
       explorerTheme,
       radius,
-      toNumber(boundsMin[1]) + modelOffset.y,
+      toNumber(boundsMin[2]) + modelOffset.z,
       normalizedSceneScaleMode,
       resolvedFloorMode
     );
     updateSpotLightTarget(runtime);
-    updateStageEffects(runtime, explorerTheme, normalizedLookSettings, radius, runtime.gridFloorY ?? 0, resolvedFloorMode);
+    updateStageEffects(runtime, explorerTheme, normalizedLookSettings, radius, runtime.gridFloorZ ?? 0, resolvedFloorMode);
 
     modelGroup.position.copy(modelOffset);
     edgesGroup.position.copy(modelOffset);
     facePickGroup.position.copy(modelOffset);
     edgePickGroup.position.copy(modelOffset);
+    vertexPickGroup.position.copy(modelOffset);
     facePickGroup.updateMatrixWorld(true);
     edgePickGroup.updateMatrixWorld(true);
+    vertexPickGroup.updateMatrixWorld(true);
+    syncSelectorPickGroups(runtime, selectorRuntimeRef.current, modelOffset);
 
-    applyPartVisualState(THREE, displayRecords, {
-      explorerTheme,
-      edgeSettings: normalizedLookSettings.edges,
-      hiddenPartIds: shouldRenderParts ? hiddenPartIds : [],
-      hoveredPartId: shouldRenderParts ? hoveredPartId : "",
-      focusedPartId: shouldRenderParts ? focusedPartId : "",
-      selectedPartIds: shouldRenderParts ? selectedPartIds : [],
-      showEdges: edgesVisible
-    });
+    const currentPartVisualState = partVisualStateRef.current;
+    applyPartVisualState(THREE, displayRecords, shouldRenderParts
+      ? currentPartVisualState
+      : {
+        ...currentPartVisualState,
+        hiddenPartIds: [],
+        hoveredPartId: "",
+        focusedPartId: [],
+        selectedPartIds: []
+      });
     modelGroup.updateMatrixWorld(true);
     edgesGroup.updateMatrixWorld(true);
 
@@ -5604,7 +5902,8 @@ const CadExplorer = forwardRef(function CadExplorer({
       );
       const nextPerspectiveMatchesScene = perspectiveSnapshotMatchesScene(nextPerspective, {
         modelKey,
-        sceneScaleMode: normalizedSceneScaleMode
+        sceneScaleMode: normalizedSceneScaleMode,
+        coordinateSystem: CAD_COORDINATE_SYSTEM
       });
       runWithoutPerspectiveEvents(() => {
         if (
@@ -5635,14 +5934,13 @@ const CadExplorer = forwardRef(function CadExplorer({
     modelKey,
     perspective,
     perspectiveRef,
-    edgesVisible,
+    displayEdgesVisible,
     recomputeNormals,
     isLoading,
     explorerReadyTick,
     pickMode,
     renderPartsIndividually,
     pickableParts,
-    focusedPartId,
     normalizedSceneScaleMode,
     resolvedFloorMode,
     explorerTheme,
@@ -5690,12 +5988,12 @@ const CadExplorer = forwardRef(function CadExplorer({
       runtime,
       explorerTheme,
       radius,
-      toNumber(boundsMin[1]) + toNumber(runtime.modelGroup?.position?.y),
+      toNumber(boundsMin[2]) + toNumber(runtime.modelGroup?.position?.z),
       normalizedSceneScaleMode,
       resolvedFloorMode
     );
     updateSpotLightTarget(runtime);
-    updateStageEffects(runtime, explorerTheme, normalizedLookSettings, radius, runtime.gridFloorY ?? 0, resolvedFloorMode);
+    updateStageEffects(runtime, explorerTheme, normalizedLookSettings, radius, runtime.gridFloorZ ?? 0, resolvedFloorMode);
     runtime.requestRender();
   }, [
     meshData?.parts,
@@ -5717,7 +6015,7 @@ const CadExplorer = forwardRef(function CadExplorer({
 
     applyPartVisualState(runtime.THREE, runtime.displayRecords, partVisualStateRef.current);
     runtime.requestRender();
-  }, [explorerReadyTick, partVisualStateEnabled, edgesVisible, focusedPartId, hiddenPartIds, hoveredPartId, pickMode, pickableParts, selectedPartIds, explorerTheme, normalizedLookSettings.edges]);
+  }, [explorerReadyTick, partVisualStateEnabled, displayEdgesVisible, focusedPartIds, hiddenPartIds, hoveredPartId, pickMode, pickableParts, selectedPartIds, explorerTheme, normalizedLookSettings.edges]);
 
   useEffect(() => {
     const runtime = runtimeRef.current;
@@ -5827,50 +6125,13 @@ const CadExplorer = forwardRef(function CadExplorer({
 
   useEffect(() => {
     const runtime = runtimeRef.current;
-    if (!runtime?.THREE || !runtime?.edgePickGroup || !runtime?.facePickGroup || !runtime?.vertexPickGroup) {
+  if (!runtime?.THREE || !runtime?.edgePickGroup || !runtime?.facePickGroup || !runtime?.vertexPickGroup) {
       return;
     }
 
-    clearSceneGroup(runtime.facePickGroup);
-    clearSceneGroup(runtime.edgePickGroup);
-    clearSceneGroup(runtime.vertexPickGroup);
-    runtime.facePickMesh = null;
-    runtime.edgePickLines = null;
-    runtime.vertexPickPoints = null;
-    runtime.edgePickObjects = [];
-
-    const facePickMesh = buildFacePickMesh(runtime.THREE, selectorRuntime);
-    if (facePickMesh) {
-      runtime.facePickMesh = facePickMesh;
-      runtime.facePickGroup.add(facePickMesh);
-    }
-
-    const edgePickLines = buildEdgePickLines(runtime.THREE, selectorRuntime);
-    if (edgePickLines) {
-      runtime.edgePickLines = edgePickLines;
-      runtime.edgePickGroup.add(edgePickLines);
-      runtime.edgePickObjects = [edgePickLines];
-    }
-
-    const vertexPickPoints = buildVertexPickPoints(runtime.THREE, selectorRuntime);
-    if (vertexPickPoints) {
-      runtime.vertexPickPoints = vertexPickPoints;
-      runtime.vertexPickGroup.add(vertexPickPoints);
-    }
-
-    if (modelTransformRef.current.offset) {
-      runtime.facePickGroup.position.copy(modelTransformRef.current.offset);
-      runtime.edgePickGroup.position.copy(modelTransformRef.current.offset);
-      runtime.vertexPickGroup.position.copy(modelTransformRef.current.offset);
-    } else {
-      runtime.facePickGroup.position.set(0, 0, 0);
-      runtime.edgePickGroup.position.set(0, 0, 0);
-      runtime.vertexPickGroup.position.set(0, 0, 0);
-    }
-    runtime.facePickGroup.updateMatrixWorld(true);
-    runtime.edgePickGroup.updateMatrixWorld(true);
-    runtime.vertexPickGroup.updateMatrixWorld(true);
-  }, [modelKey, selectorRuntime, explorerReadyTick]);
+    syncDisplayMeshFaceIds(runtime, meshData, selectorRuntime);
+    syncSelectorPickGroups(runtime, selectorRuntime, modelTransformRef.current.offset);
+  }, [meshData, modelKey, selectorRuntime, explorerReadyTick]);
 
   useEffect(() => {
     const runtime = runtimeRef.current;
@@ -6132,7 +6393,8 @@ const CadExplorer = forwardRef(function CadExplorer({
       }
 
       if (selectorType === "face") {
-        const fillGeometry = buildFaceFillGeometryFromProxy(runtime, THREE, selectorRuntime, topologyReference);
+        const fillGeometry = buildFaceFillGeometryFromDisplayMeshes(runtime, THREE, topologyReference) ||
+          buildFaceFillGeometryFromProxy(runtime, THREE, selectorRuntime, topologyReference);
         if (fillGeometry) {
           const fillMaterial = new THREE.MeshBasicMaterial({
             color: highlightColor,
@@ -6199,7 +6461,7 @@ const CadExplorer = forwardRef(function CadExplorer({
     pickableFaces: filteredPickableFaces,
     pickableEdges: filteredPickableEdges,
     pickableVertices: filteredPickableVertices,
-    focusedPartId: focusedPartIdValue,
+    focusedPartId: focusedPartIds,
     onHoverReferenceChange,
     onActivateReference,
     onDoubleActivateReference,

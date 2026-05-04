@@ -31,27 +31,35 @@ export function clonePerspectiveSnapshot(snapshot) {
   };
   const modelKey = normalizePerspectiveMetadataValue(snapshot.modelKey);
   const sceneScaleMode = normalizePerspectiveMetadataValue(snapshot.sceneScaleMode);
+  const coordinateSystem = normalizePerspectiveMetadataValue(snapshot.coordinateSystem);
   if (modelKey) {
     clonedSnapshot.modelKey = modelKey;
   }
   if (sceneScaleMode) {
     clonedSnapshot.sceneScaleMode = sceneScaleMode;
   }
+  if (coordinateSystem) {
+    clonedSnapshot.coordinateSystem = coordinateSystem;
+  }
   return clonedSnapshot;
 }
 
-export function annotatePerspectiveSnapshot(snapshot, { modelKey = "", sceneScaleMode = "" } = {}) {
+export function annotatePerspectiveSnapshot(snapshot, { modelKey = "", sceneScaleMode = "", coordinateSystem = "" } = {}) {
   const annotatedSnapshot = clonePerspectiveSnapshot(snapshot);
   if (!annotatedSnapshot) {
     return null;
   }
   const normalizedModelKey = normalizePerspectiveMetadataValue(modelKey);
   const normalizedSceneScaleMode = normalizePerspectiveMetadataValue(sceneScaleMode);
+  const normalizedCoordinateSystem = normalizePerspectiveMetadataValue(coordinateSystem);
   if (normalizedModelKey) {
     annotatedSnapshot.modelKey = normalizedModelKey;
   }
   if (normalizedSceneScaleMode) {
     annotatedSnapshot.sceneScaleMode = normalizedSceneScaleMode;
+  }
+  if (normalizedCoordinateSystem) {
+    annotatedSnapshot.coordinateSystem = normalizedCoordinateSystem;
   }
   return annotatedSnapshot;
 }
@@ -90,11 +98,12 @@ export function perspectiveSnapshotEqual(a, b, epsilon = 1e-4) {
     perspectiveVectorEqual(a.target, b.target, epsilon) &&
     perspectiveVectorEqual(a.up, b.up, epsilon) &&
     normalizePerspectiveMetadataValue(a.modelKey) === normalizePerspectiveMetadataValue(b.modelKey) &&
-    normalizePerspectiveMetadataValue(a.sceneScaleMode) === normalizePerspectiveMetadataValue(b.sceneScaleMode)
+    normalizePerspectiveMetadataValue(a.sceneScaleMode) === normalizePerspectiveMetadataValue(b.sceneScaleMode) &&
+    normalizePerspectiveMetadataValue(a.coordinateSystem) === normalizePerspectiveMetadataValue(b.coordinateSystem)
   );
 }
 
-export function perspectiveSnapshotMatchesScene(snapshot, { modelKey = "", sceneScaleMode = "" } = {}) {
+export function perspectiveSnapshotMatchesScene(snapshot, { modelKey = "", sceneScaleMode = "", coordinateSystem = "" } = {}) {
   const normalizedSnapshot = clonePerspectiveSnapshot(snapshot);
   if (!normalizedSnapshot) {
     return false;
@@ -105,6 +114,10 @@ export function perspectiveSnapshotMatchesScene(snapshot, { modelKey = "", scene
   }
   const normalizedSceneScaleMode = normalizePerspectiveMetadataValue(sceneScaleMode);
   if (normalizedSceneScaleMode && normalizedSnapshot.sceneScaleMode !== normalizedSceneScaleMode) {
+    return false;
+  }
+  const normalizedCoordinateSystem = normalizePerspectiveMetadataValue(coordinateSystem);
+  if (normalizedCoordinateSystem && normalizedSnapshot.coordinateSystem !== normalizedCoordinateSystem) {
     return false;
   }
   return true;

@@ -650,18 +650,6 @@ const TERMINAL_LOOK_SETTINGS = Object.freeze({
 
 export const LOOK_PRESETS = Object.freeze([
   {
-    id: "workbench",
-    label: "Workbench",
-    description: "Clean Onshape-style CAD editor canvas with white workspace light.",
-    preview: {
-      background: "linear-gradient(135deg, #ffffff 0%, #f4f4f5 58%, #d4d4d8 100%)",
-      modelColor: "#e4e4e7",
-      accentColor: "#71717a"
-    },
-    glassTone: "light",
-    settings: CAD_WORKSPACE_LOOK_SETTINGS
-  },
-  {
     id: "cinematic",
     label: "Cinematic",
     description: "Dark navy studio lighting with cool highlights, soft floor shadows, and cinematic depth.",
@@ -672,6 +660,18 @@ export const LOOK_PRESETS = Object.freeze([
     },
     glassTone: "dark",
     settings: CINEMATIC_LOOK_SETTINGS
+  },
+  {
+    id: "workbench",
+    label: "Workbench",
+    description: "Clean Onshape-style CAD editor canvas with white workspace light.",
+    preview: {
+      background: "linear-gradient(135deg, #ffffff 0%, #f4f4f5 58%, #d4d4d8 100%)",
+      modelColor: "#e4e4e7",
+      accentColor: "#71717a"
+    },
+    glassTone: "light",
+    settings: CAD_WORKSPACE_LOOK_SETTINGS
   },
   {
     id: "blue",

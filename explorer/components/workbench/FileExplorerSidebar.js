@@ -4,7 +4,8 @@ import {
   ChevronRight,
   DraftingCompass,
   LoaderCircle,
-  Package
+  Package,
+  TriangleAlert
 } from "lucide-react";
 import {
   Collapsible,
@@ -36,7 +37,18 @@ import {
   sidebarLabelForEntry
 } from "../../lib/workbench/sidebar";
 
-function iconForEntry(entry, sourceFormat, pending) {
+function stepArtifactsMissing(entry, sourceFormat) {
+  return (
+    sourceFormat === RENDER_FORMAT.STEP &&
+    entry?.stepArtifact?.ok === false &&
+    String(entry?.stepArtifact?.error?.code || "") === "missing_glb"
+  );
+}
+
+function iconForEntry(entry, sourceFormat, pending, missingArtifacts) {
+  if (missingArtifacts) {
+    return TriangleAlert;
+  }
   if (pending) {
     return LoaderCircle;
   }
@@ -73,10 +85,11 @@ function FileEntryButton({
     : sourceFormat === RENDER_FORMAT.URDF
       ? !entryHasUrdf(entry)
       : !entryHasMesh(entry);
-  const EntryIcon = iconForEntry(entry, sourceFormat, pending);
+  const missingArtifacts = stepArtifactsMissing(entry, sourceFormat);
+  const EntryIcon = iconForEntry(entry, sourceFormat, pending, missingArtifacts);
   const title = [
     label,
-    pending ? "pending" : "ready",
+    missingArtifacts ? "artifacts missing" : pending ? "pending" : "ready",
     entry?.kind,
     String(entry?.source?.path || entry?.step?.path || "")
   ].filter(Boolean).join(" | ");
@@ -98,7 +111,7 @@ function FileEntryButton({
       }}
       tooltip={label}
     >
-      <EntryIcon className={cn(pending && "animate-spin")} aria-hidden="true" />
+      <EntryIcon className={cn(pending && !missingArtifacts && "animate-spin")} aria-hidden="true" />
       <span className="block min-w-0 flex-1 max-w-full overflow-hidden text-ellipsis whitespace-nowrap">{label}</span>
     </SidebarMenuButton>
   );

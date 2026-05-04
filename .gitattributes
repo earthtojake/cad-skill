@@ -1,2 +1,0 @@
-# Keep bulky demo media available through LFS without hydrating it in default clones.
-assets/*.gif filter=lfs diff=lfs merge=lfs -text

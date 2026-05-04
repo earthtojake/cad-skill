@@ -1,4 +1,4 @@
-import { mergeBounds, transformBounds, transformPoint } from "../urdf/kinematics.js";
+import { mergeBounds } from "../urdf/kinematics.js";
 
 const IDENTITY_TRANSFORM = Object.freeze([
   1, 0, 0, 0,
@@ -14,72 +14,13 @@ function toTransformArray(value) {
   return value.map((component, index) => Number.isFinite(Number(component)) ? Number(component) : IDENTITY_TRANSFORM[index]);
 }
 
-function normalizeVector(vector) {
-  const x = Number(vector?.[0] || 0);
-  const y = Number(vector?.[1] || 0);
-  const z = Number(vector?.[2] || 0);
-  const length = Math.hypot(x, y, z);
-  if (length <= 1e-9) {
-    return [0, 0, 1];
-  }
-  return [x / length, y / length, z / length];
+export function assemblyMeshDescriptor(topologyManifest) {
+  const mesh = topologyManifest?.assembly?.mesh;
+  return mesh && typeof mesh === "object" ? mesh : null;
 }
 
-function transformVector(transform, vector) {
-  const matrix = toTransformArray(transform);
-  return normalizeVector([
-    (matrix[0] * vector[0]) + (matrix[1] * vector[1]) + (matrix[2] * vector[2]),
-    (matrix[4] * vector[0]) + (matrix[5] * vector[1]) + (matrix[6] * vector[2]),
-    (matrix[8] * vector[0]) + (matrix[9] * vector[1]) + (matrix[10] * vector[2])
-  ]);
-}
-
-function copyTransformedVertices(target, targetOffset, source, transform) {
-  for (let index = 0; index < source.length; index += 3) {
-    const point = transformPoint(transform, [source[index], source[index + 1], source[index + 2]]);
-    target[targetOffset + index] = point[0];
-    target[targetOffset + index + 1] = point[1];
-    target[targetOffset + index + 2] = point[2];
-  }
-}
-
-function copyTransformedNormals(target, targetOffset, source, transform, count) {
-  if (!source || source.length < count * 3) {
-    return;
-  }
-  for (let index = 0; index < count * 3; index += 3) {
-    const vector = transformVector(transform, [source[index], source[index + 1], source[index + 2]]);
-    target[targetOffset + index] = vector[0];
-    target[targetOffset + index + 1] = vector[1];
-    target[targetOffset + index + 2] = vector[2];
-  }
-}
-
-function copyColors(target, targetOffset, source, count) {
-  if (!source || source.length < count * 3) {
-    return;
-  }
-  for (let index = 0; index < count * 3; index += 1) {
-    target[targetOffset + index] = source[index];
-  }
-}
-
-function sourceMeshForPart(meshesBySourcePath, sourcePath) {
-  if (meshesBySourcePath instanceof Map) {
-    return meshesBySourcePath.get(sourcePath) || null;
-  }
-  if (meshesBySourcePath && typeof meshesBySourcePath === "object") {
-    return meshesBySourcePath[sourcePath] || null;
-  }
-  return null;
-}
-
-function meshKeyForPart(part) {
-  return String(part?.sourcePath || part?.id || part?.occurrenceId || "").trim();
-}
-
-function meshUrlForPart(part) {
-  return String(part?.assets?.glb?.url || part?.meshUrl || "").trim();
+export function assemblyUsesSelfContainedMesh(topologyManifest) {
+  return String(assemblyMeshDescriptor(topologyManifest)?.addressing || "").trim() === "gltf-node-extras";
 }
 
 export function assemblyRootFromTopology(topologyManifest) {
@@ -250,127 +191,168 @@ export function assemblyBreadcrumb(root, nodeId) {
   return visit(root) ? [...path] : [root];
 }
 
-export function assemblyCompositionMeshRequests(topologyManifest) {
-  const root = assemblyRootFromTopology(topologyManifest);
-  const requestsByKey = new Map();
-  for (const part of flattenAssemblyLeafParts(root)) {
-    const sourcePath = String(part?.sourcePath || "").trim();
-    const key = meshKeyForPart(part);
-    if (!key) {
-      continue;
-    }
-    const meshUrl = meshUrlForPart(part);
-    if (requestsByKey.has(key)) {
-      const request = requestsByKey.get(key);
-      if (!request.meshUrl && meshUrl) {
-        request.meshUrl = meshUrl;
-      }
-      continue;
-    }
-    requestsByKey.set(key, {
-      key,
-      sourcePath,
-      meshUrl
-    });
-  }
-  return [...requestsByKey.values()];
+function meshPartId(part) {
+  return String(part?.occurrenceId || part?.id || "").trim();
 }
 
-export function buildAssemblyMeshData(topologyManifest, meshesBySourcePath) {
+function meshPartNumericValue(part, key) {
+  return Math.max(0, Math.floor(Number(part?.[key]) || 0));
+}
+
+function meshPartIdMatches(part, ids) {
+  const partIds = [
+    String(part?.occurrenceId || "").trim(),
+    String(part?.id || "").trim()
+  ].filter(Boolean);
+  return partIds.some((partId) => ids.has(partId));
+}
+
+function meshPartIdHasPrefix(part, prefixes) {
+  const partIds = [
+    String(part?.occurrenceId || "").trim(),
+    String(part?.id || "").trim()
+  ].filter(Boolean);
+  return partIds.some((partId) => prefixes.some((prefix) => partId.startsWith(prefix)));
+}
+
+function meshPartsForTopologyLeaf(meshData, manifestPart) {
+  const allParts = Array.isArray(meshData?.parts) ? meshData.parts : [];
+  const ids = new Set(
+    [manifestPart?.occurrenceId, manifestPart?.id]
+      .map((id) => String(id || "").trim())
+      .filter(Boolean)
+  );
+  const exactParts = allParts.filter((part) => meshPartIdMatches(part, ids));
+  if (exactParts.length) {
+    return exactParts;
+  }
+  const prefixes = [...ids].map((id) => `${id}.`);
+  return prefixes.length ? allParts.filter((part) => meshPartIdHasPrefix(part, prefixes)) : [];
+}
+
+export function buildSelfContainedAssemblyMeshData(topologyManifest, meshData) {
   const assemblyRoot = assemblyRootFromTopology(topologyManifest);
   if (!assemblyRoot) {
     throw new Error("Assembly topology is missing assembly.root");
   }
   const manifestParts = flattenAssemblyLeafParts(assemblyRoot);
+  const partSources = manifestParts.map((manifestPart) => {
+    const partId = String(manifestPart?.id || manifestPart?.occurrenceId || "").trim();
+    const occurrenceId = String(manifestPart?.occurrenceId || manifestPart?.id || "").trim();
+    const sourceParts = meshPartsForTopologyLeaf(meshData, manifestPart);
+    if (!sourceParts.length) {
+      throw new Error(`Missing GLB node for assembly occurrence ${occurrenceId || partId || "(unknown)"}`);
+    }
+    return {
+      manifestPart,
+      sourceParts
+    };
+  });
   let totalVertexCount = 0;
   let totalIndexCount = 0;
-  let hasSourceColors = false;
-  for (const part of manifestParts) {
-    const key = meshKeyForPart(part);
-    const sourceMesh = sourceMeshForPart(meshesBySourcePath, key);
-    if (!sourceMesh) {
-      throw new Error(`Missing source mesh for assembly part ${key || "(unknown)"}`);
+  for (const { sourceParts } of partSources) {
+    for (const sourcePart of sourceParts) {
+      totalVertexCount += meshPartNumericValue(sourcePart, "vertexCount");
+      totalIndexCount += meshPartNumericValue(sourcePart, "triangleCount") * 3;
     }
-    totalVertexCount += Math.floor((sourceMesh.vertices?.length || 0) / 3);
-    totalIndexCount += sourceMesh.indices?.length || 0;
-    hasSourceColors ||= manifestPartUsesSourceColors(part) && sourceMeshHasColors(sourceMesh);
   }
-
+  const sourceVertices = meshData?.vertices || new Float32Array(0);
+  const sourceNormals = meshData?.normals || new Float32Array(0);
+  const sourceColors = meshData?.colors || new Float32Array(0);
+  const sourceIndices = meshData?.indices || new Uint32Array(0);
+  const hasSourceColors = sourceColors.length === sourceVertices.length && sourceColors.length > 0;
   const vertices = new Float32Array(totalVertexCount * 3);
   const normals = new Float32Array(totalVertexCount * 3);
-  const colors = hasSourceColors ? new Float32Array(totalVertexCount * 3).fill(1) : new Float32Array(0);
+  const colors = hasSourceColors ? new Float32Array(totalVertexCount * 3) : new Float32Array(0);
   const indices = new Uint32Array(totalIndexCount);
   const parts = [];
   let vertexOffset = 0;
   let indexOffset = 0;
 
-  for (const manifestPart of manifestParts) {
-    const sourcePath = String(manifestPart?.sourcePath || "").trim();
-    const key = meshKeyForPart(manifestPart);
-    const sourceMesh = sourceMeshForPart(meshesBySourcePath, key);
-    const sourceVertices = sourceMesh.vertices || new Float32Array(0);
-    const sourceNormals = sourceMesh.normals || new Float32Array(0);
-    const sourceColors = sourceMesh.colors || new Float32Array(0);
-    const sourceIndices = sourceMesh.indices || new Uint32Array(0);
-    const transform = toTransformArray(manifestPart?.worldTransform || manifestPart?.transform);
-    const vertexCount = Math.floor(sourceVertices.length / 3);
-    const triangleCount = Math.floor(sourceIndices.length / 3);
-    const partHasSourceColors = manifestPartUsesSourceColors(manifestPart) && sourceMeshHasColors(sourceMesh);
+  for (const { manifestPart, sourceParts } of partSources) {
+    const partId = String(manifestPart?.id || manifestPart?.occurrenceId || "").trim();
+    const occurrenceId = String(manifestPart?.occurrenceId || manifestPart?.id || "").trim();
+    const firstMeshPart = sourceParts[0];
     const partVertexOffset = vertexOffset;
     const partTriangleOffset = Math.floor(indexOffset / 3);
-    const positionOffset = partVertexOffset * 3;
+    const sourcePartRanges = [];
 
-    copyTransformedVertices(vertices, positionOffset, sourceVertices, transform);
-    copyTransformedNormals(normals, positionOffset, sourceNormals, transform, vertexCount);
-    if (hasSourceColors && partHasSourceColors) {
-      copyColors(colors, positionOffset, sourceColors, vertexCount);
-    }
-    for (let index = 0; index < sourceIndices.length; index += 1) {
-      indices[indexOffset + index] = sourceIndices[index] + partVertexOffset;
+    for (const sourcePart of sourceParts) {
+      const sourceVertexOffset = meshPartNumericValue(sourcePart, "vertexOffset");
+      const sourceVertexCount = meshPartNumericValue(sourcePart, "vertexCount");
+      const sourceTriangleOffset = meshPartNumericValue(sourcePart, "triangleOffset");
+      const sourceTriangleCount = meshPartNumericValue(sourcePart, "triangleCount");
+      const rangeTriangleOffset = Math.floor(indexOffset / 3) - partTriangleOffset;
+      sourcePartRanges.push({
+        occurrenceId: meshPartId(sourcePart),
+        primitiveIndex: meshPartNumericValue(sourcePart, "primitiveIndex"),
+        triangleOffset: rangeTriangleOffset,
+        triangleCount: sourceTriangleCount
+      });
+      const sourcePositionStart = sourceVertexOffset * 3;
+      const sourcePositionEnd = sourcePositionStart + sourceVertexCount * 3;
+      vertices.set(sourceVertices.subarray(sourcePositionStart, sourcePositionEnd), vertexOffset * 3);
+      if (sourceNormals.length >= sourcePositionEnd) {
+        normals.set(sourceNormals.subarray(sourcePositionStart, sourcePositionEnd), vertexOffset * 3);
+      }
+      if (hasSourceColors && sourceColors.length >= sourcePositionEnd) {
+        colors.set(sourceColors.subarray(sourcePositionStart, sourcePositionEnd), vertexOffset * 3);
+      }
+      const sourceIndexStart = sourceTriangleOffset * 3;
+      const sourceIndexEnd = sourceIndexStart + sourceTriangleCount * 3;
+      for (let index = sourceIndexStart; index < sourceIndexEnd; index += 1) {
+        indices[indexOffset] = sourceIndices[index] - sourceVertexOffset + vertexOffset;
+        indexOffset += 1;
+      }
+      vertexOffset += sourceVertexCount;
     }
 
-    const bounds = manifestPart?.bbox || transformBounds(sourceMesh.bounds, transform);
+    const sourcePath = String(manifestPart?.sourcePath || "").trim();
     const displayName = String(
       manifestPart?.displayName ||
       manifestPart?.instancePath ||
       manifestPart?.occurrenceId ||
       sourcePath ||
-      key
+      firstMeshPart?.label ||
+      firstMeshPart?.name ||
+      meshPartId(firstMeshPart)
     ).trim();
+    const sourceBounds = mergeBounds(sourceParts.map((part) => part.bounds));
     parts.push({
+      ...firstMeshPart,
       ...manifestPart,
-      id: String(manifestPart?.id || manifestPart?.occurrenceId || "").trim(),
-      occurrenceId: String(manifestPart?.occurrenceId || manifestPart?.id || "").trim(),
+      id: partId || occurrenceId || meshPartId(firstMeshPart),
+      occurrenceId: occurrenceId || partId || meshPartId(firstMeshPart),
       name: displayName,
       label: displayName,
       nodeType: "part",
       sourceKind: String(manifestPart?.sourceKind || "").trim(),
       sourcePath,
       partSourcePath: sourcePath,
-      sourceBounds: sourceMesh.bounds,
-      bounds,
-      transform,
-      hasSourceColors: partHasSourceColors,
+      sourceBounds,
+      bounds: manifestPart?.bbox || sourceBounds,
+      transform: toTransformArray(manifestPart?.worldTransform || manifestPart?.transform),
+      hasSourceColors: manifestPartUsesSourceColors(manifestPart) && (
+        hasSourceColors || sourceParts.some((part) => !!part.hasSourceColors || !!part.color)
+      ),
       vertexOffset: partVertexOffset,
-      vertexCount,
+      vertexCount: vertexOffset - partVertexOffset,
       triangleOffset: partTriangleOffset,
-      triangleCount,
+      triangleCount: Math.floor(indexOffset / 3) - partTriangleOffset,
+      sourcePartRanges,
       edgeIndexOffset: 0,
       edgeIndexCount: 0
     });
-
-    vertexOffset += vertexCount;
-    indexOffset += sourceIndices.length;
   }
-
   return {
+    ...meshData,
     vertices,
     indices,
     normals,
     colors,
     edge_indices: new Uint32Array(0),
-    bounds: mergeBounds(parts.map((part) => part.bounds)),
     parts,
+    bounds: mergeBounds(parts.map((part) => part.bounds)) || meshData?.bounds,
     assemblyRoot,
     has_source_colors: hasSourceColors
   };
@@ -378,10 +360,4 @@ export function buildAssemblyMeshData(topologyManifest, meshesBySourcePath) {
 
 function manifestPartUsesSourceColors(part) {
   return part?.useSourceColors !== false;
-}
-
-function sourceMeshHasColors(sourceMesh) {
-  return !!sourceMesh?.has_source_colors &&
-    sourceMesh.colors?.length > 0 &&
-    sourceMesh.colors.length === sourceMesh.vertices?.length;
 }

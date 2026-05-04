@@ -1,6 +1,5 @@
 import { useEffect, useLayoutEffect, useRef } from "react";
 
-import { CAD_WORKSPACE_DESKTOP_MEDIA_QUERY } from "../../../lib/workbench/breakpoints.js";
 import { filenameLabelForEntry } from "../../../lib/workbench/sidebar.js";
 
 function normalizeRestoredOpenTabs(openTabs, createTabRecord, initialSelectedTabSnapshot) {
@@ -39,16 +38,14 @@ function normalizeRestoredOpenTabs(openTabs, createTabRecord, initialSelectedTab
 export function restoredSidebarWidthForViewport(
   restoredSession,
   {
-    desktopViewport = false,
     defaultSidebarWidth = 260,
     sidebarMinWidth = 0
   } = {}
 ) {
   const restoredWidth = Number(restoredSession?.sidebarWidth);
   const nextWidth = Number.isFinite(restoredWidth) ? restoredWidth : defaultSidebarWidth;
-  const restoredDesktopSidebarOpen = restoredSession?.desktopSidebarOpen ?? restoredSession?.sidebarOpen;
 
-  if (desktopViewport && restoredDesktopSidebarOpen && nextWidth <= sidebarMinWidth) {
+  if (restoredSession?.sidebarOpen && nextWidth <= sidebarMinWidth) {
     return defaultSidebarWidth;
   }
 
@@ -65,11 +62,8 @@ export function useCadWorkspaceSession({
   setQuery,
   setExpandedDirectoryIds,
   setSidebarOpen,
-  setMobileSidebarOpen,
-  setDesktopFileSheetOpen,
-  setMobileFileSheetOpen,
-  setDesktopLookMenuOpen,
-  setMobileLookMenuOpen,
+  setFileSheetOpen,
+  setLookMenuOpen,
   setSidebarWidth,
   setTabToolsWidth,
   setUrdfEntryAnimationEnabled,
@@ -119,9 +113,7 @@ export function useCadWorkspaceSession({
     const restoredSession = readCadWorkspaceSessionState(validEntryKeys);
     if (restoredSession) {
       restoredCadWorkspaceSessionRef.current = true;
-      const desktopViewport = window.matchMedia(CAD_WORKSPACE_DESKTOP_MEDIA_QUERY).matches;
       const restoredSidebarWidth = restoredSidebarWidthForViewport(restoredSession, {
-        desktopViewport,
         defaultSidebarWidth,
         sidebarMinWidth
       });
@@ -132,12 +124,9 @@ export function useCadWorkspaceSession({
       );
       setQuery(restoredSession.query);
       setExpandedDirectoryIds(new Set(restoredSession.expandedDirectoryIds));
-      setSidebarOpen(restoredSession.desktopSidebarOpen);
-      setMobileSidebarOpen(restoredSession.mobileSidebarOpen);
-      setDesktopFileSheetOpen(restoredSession.desktopFileSheetOpen);
-      setMobileFileSheetOpen(restoredSession.mobileFileSheetOpen);
-      setDesktopLookMenuOpen(restoredSession.desktopLookSheetOpen);
-      setMobileLookMenuOpen(restoredSession.mobileLookSheetOpen);
+      setSidebarOpen(restoredSession.sidebarOpen);
+      setFileSheetOpen(restoredSession.fileSheetOpen);
+      setLookMenuOpen(restoredSession.lookSheetOpen);
       setSidebarWidth(restoredSidebarWidth);
       setTabToolsWidth(restoredSession.tabToolsWidth);
       setUrdfEntryAnimationEnabled(restoredSession.urdfEntryAnimationEnabled);
@@ -183,11 +172,8 @@ export function useCadWorkspaceSession({
     restoredCadWorkspaceSessionRef,
     selectedEntryKeyFromUrl,
     setExpandedDirectoryIds,
-    setDesktopFileSheetOpen,
-    setDesktopLookMenuOpen,
-    setMobileFileSheetOpen,
-    setMobileLookMenuOpen,
-    setMobileSidebarOpen,
+    setFileSheetOpen,
+    setLookMenuOpen,
     setOpenTabs,
     setPendingCadRefQueryParams,
     setQuery,

@@ -18,8 +18,10 @@ const glbCache = new Map();
 const stlCache = new Map();
 const threeMfCache = new Map();
 const selectorCache = new Map();
+const topologyIndexCache = new Map();
 const dxfCache = new Map();
 const urdfCache = new Map();
+const STEP_TOPOLOGY_EXTENSION = "STEP_topology";
 
 async function fetchJson(url, { signal } = {}) {
   const response = await fetch(url, { signal });
@@ -148,32 +150,87 @@ export function peekRender3Mf(url) {
   return peekCached(threeMfCache, url);
 }
 
-function buildTypedView(arrayBuffer, view) {
+function parseGlbContainer(arrayBuffer) {
+  const data = new DataView(arrayBuffer);
+  if (data.byteLength < 20 || data.getUint32(0, true) !== 0x46546c67 || data.getUint32(4, true) !== 2) {
+    throw new Error("Invalid GLB topology container");
+  }
+  const totalLength = Math.min(data.getUint32(8, true), data.byteLength);
+  let offset = 12;
+  let json = null;
+  let bin = null;
+  while (offset + 8 <= totalLength) {
+    const chunkLength = data.getUint32(offset, true);
+    const chunkType = data.getUint32(offset + 4, true);
+    offset += 8;
+    if (offset + chunkLength > totalLength) {
+      throw new Error("Invalid GLB chunk length");
+    }
+    if (chunkType === 0x4e4f534a) {
+      json = JSON.parse(new TextDecoder("utf-8").decode(arrayBuffer.slice(offset, offset + chunkLength)).trim());
+    } else if (chunkType === 0x004e4942) {
+      bin = {
+        buffer: arrayBuffer,
+        byteOffset: offset,
+        byteLength: chunkLength,
+      };
+    }
+    offset += chunkLength;
+  }
+  if (!json || !bin) {
+    throw new Error("GLB topology requires JSON and BIN chunks");
+  }
+  return { json, bin };
+}
+
+function glbBufferViewRange(gltf, bin, viewIndex) {
+  const index = Number(viewIndex);
+  const view = Array.isArray(gltf?.bufferViews) ? gltf.bufferViews[index] : null;
+  if (!Number.isInteger(index) || !view || Number(view.buffer || 0) !== 0) {
+    return null;
+  }
+  const byteOffset = bin.byteOffset + Number(view.byteOffset || 0);
+  const byteLength = Number(view.byteLength || 0);
+  if (!Number.isFinite(byteOffset) || !Number.isFinite(byteLength) || byteLength < 0) {
+    return null;
+  }
+  if (byteOffset < bin.byteOffset || byteOffset + byteLength > bin.byteOffset + bin.byteLength) {
+    return null;
+  }
+  return { byteOffset, byteLength };
+}
+
+function buildTypedView(glb, view) {
   if (!isObject(view)) {
     return null;
   }
-  const count = Number(view.count || 0);
-  const offset = Number(view.offset || 0);
-  if (!Number.isFinite(count) || count < 0 || !Number.isFinite(offset) || offset < 0) {
+  const range = glbBufferViewRange(glb.json, glb.bin, view.bufferView);
+  if (!range) {
     return null;
   }
+  const count = Number(view.count || 0);
+  const relativeOffset = Number(view.byteOffset || 0);
+  if (!Number.isFinite(count) || count < 0 || !Number.isFinite(relativeOffset) || relativeOffset < 0) {
+    return null;
+  }
+  const byteOffset = range.byteOffset + relativeOffset;
   if (view.dtype === "float32") {
-    return new Float32Array(arrayBuffer, offset, count);
+    return new Float32Array(glb.bin.buffer, byteOffset, count);
   }
   if (view.dtype === "uint32") {
-    return new Uint32Array(arrayBuffer, offset, count);
+    return new Uint32Array(glb.bin.buffer, byteOffset, count);
   }
   return null;
 }
 
-function buildSelectorBuffers(manifest, arrayBuffer) {
+function buildSelectorBuffers(manifest, glb) {
   const views = manifest?.buffers?.views;
   if (!isObject(views)) {
     return {};
   }
   const output = {};
   for (const [name, view] of Object.entries(views)) {
-    const typed = buildTypedView(arrayBuffer, view);
+    const typed = buildTypedView(glb, view);
     if (typed) {
       output[name] = typed;
     }
@@ -181,32 +238,72 @@ function buildSelectorBuffers(manifest, arrayBuffer) {
   return output;
 }
 
-export async function loadRenderSelectorBundle(manifestUrl, binaryUrl = "", { signal } = {}) {
-  const cacheKey = `${manifestUrl}::${binaryUrl}`;
+function stepTopologyExtension(glb) {
+  const extension = glb.json?.extensions?.[STEP_TOPOLOGY_EXTENSION];
+  if (!isObject(extension) || Number(extension.schemaVersion) !== 1) {
+    throw new Error(`GLB is missing ${STEP_TOPOLOGY_EXTENSION}`);
+  }
+  return extension;
+}
+
+function parseJsonBufferView(glb, viewIndex, encoding = "utf-8") {
+  const range = glbBufferViewRange(glb.json, glb.bin, viewIndex);
+  if (!range) {
+    return null;
+  }
+  const bytes = new Uint8Array(glb.bin.buffer, range.byteOffset, range.byteLength);
+  return JSON.parse(new TextDecoder(String(encoding || "utf-8")).decode(bytes));
+}
+
+function topologyIndexFromGlbBuffer(arrayBuffer) {
+  const glb = parseGlbContainer(arrayBuffer);
+  const extension = stepTopologyExtension(glb);
+  const manifest = parseJsonBufferView(glb, extension.indexView, extension.encoding);
+  if (!isObject(manifest)) {
+    throw new Error(`${STEP_TOPOLOGY_EXTENSION} indexView is invalid`);
+  }
+  return manifest;
+}
+
+function selectorBundleFromGlbBuffer(arrayBuffer) {
+  const glb = parseGlbContainer(arrayBuffer);
+  const extension = stepTopologyExtension(glb);
+  const manifest = parseJsonBufferView(glb, extension.selectorView, extension.encoding);
+  if (!isObject(manifest)) {
+    throw new Error(`${STEP_TOPOLOGY_EXTENSION} selectorView is not available`);
+  }
+  if (manifest?.buffers?.littleEndian === false) {
+    throw new Error("Big-endian selector buffers are not supported");
+  }
+  return {
+    manifest,
+    buffers: buildSelectorBuffers(manifest, glb),
+  };
+}
+
+export async function loadRenderTopologyIndex(glbUrl, { signal } = {}) {
+  const manifest = await loadCached(topologyIndexCache, glbUrl, async () => {
+    const arrayBuffer = await loadRenderArrayBuffer(glbUrl, { signal });
+    return topologyIndexFromGlbBuffer(arrayBuffer);
+  }, { cachePending: !signal });
+  return finalizeCached(topologyIndexCache, glbUrl, manifest);
+}
+
+export function peekRenderTopologyIndex(glbUrl) {
+  return peekCached(topologyIndexCache, glbUrl);
+}
+
+export async function loadRenderSelectorBundle(glbUrl, { signal } = {}) {
+  const cacheKey = glbUrl;
   const bundle = await loadCached(selectorCache, cacheKey, async () => {
-    const manifest = await loadRenderJson(manifestUrl, { signal });
-    const resolvedBinaryUrl = binaryUrl || (
-      typeof manifest?.buffers?.uri === "string" && manifest.buffers.uri
-        ? new URL(manifest.buffers.uri, manifestUrl).toString()
-        : ""
-    );
-    if (!resolvedBinaryUrl) {
-      return { manifest, buffers: {} };
-    }
-    if (manifest?.buffers?.littleEndian === false) {
-      throw new Error("Big-endian selector buffers are not supported");
-    }
-    const arrayBuffer = await loadRenderArrayBuffer(resolvedBinaryUrl, { signal });
-    return {
-      manifest,
-      buffers: buildSelectorBuffers(manifest, arrayBuffer),
-    };
+    const arrayBuffer = await loadRenderArrayBuffer(glbUrl, { signal });
+    return selectorBundleFromGlbBuffer(arrayBuffer);
   }, { cachePending: !signal });
   return finalizeCached(selectorCache, cacheKey, bundle);
 }
 
-export function peekRenderSelectorBundle(manifestUrl, binaryUrl = "") {
-  return peekCached(selectorCache, `${manifestUrl}::${binaryUrl}`);
+export function peekRenderSelectorBundle(glbUrl) {
+  return peekCached(selectorCache, glbUrl);
 }
 
 export async function loadRenderDxf(url, { signal } = {}) {

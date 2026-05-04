@@ -1,13 +1,12 @@
 import shutil
 import unittest
-from pathlib import Path
 
 from common.assembly_spec import (
     IDENTITY_TRANSFORM,
     AssemblySpecError,
     assembly_spec_from_payload,
 )
-from tests.cad_test_roots import IsolatedCadRoots
+from common.tests.cad_test_roots import IsolatedCadRoots
 
 
 class AssemblySpecTests(unittest.TestCase):

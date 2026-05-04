@@ -1,17 +1,14 @@
 from __future__ import annotations
 
 import hashlib
-import json
 import math
-import os
-import sys
 import time
 from array import array
 from dataclasses import dataclass, field
-from enum import Enum
 from pathlib import Path
 from typing import Any
 
+from OCP.BinXCAFDrivers import BinXCAFDrivers
 from OCP.Bnd import Bnd_Box
 from OCP.BRep import BRep_Builder, BRep_Tool
 from OCP.BRepAdaptor import BRepAdaptor_Curve, BRepAdaptor_Surface
@@ -50,15 +47,18 @@ from OCP.XCAFDoc import (
     XCAFDoc_ShapeTool,
 )
 
+from common.glb_mesh_payload import (
+    DEFAULT_MATERIAL as DEFAULT_TOPOLOGY_MATERIAL,
+    normalize_rgba as _normalize_rgba,
+    occurrence_color_for_id as _occurrence_color_for_id,
+    scene_glb_mesh_payload,
+    transform_normal_from_occ as _transform_normal_from_occ,
+)
+from common.selector_types import SelectorBundle, SelectorProfile
+
 
 REPO_ROOT = Path.cwd().resolve()
 ColorRGBA = tuple[float, float, float, float]
-
-
-class SelectorProfile(str, Enum):
-    SUMMARY = "summary"
-    REFS = "refs"
-    ARTIFACT = "artifact"
 
 
 @dataclass(frozen=True)
@@ -73,12 +73,6 @@ class SelectorOptions:
 
 
 @dataclass
-class SelectorBundle:
-    manifest: dict[str, Any]
-    buffers: dict[str, array] = field(default_factory=dict)
-
-
-@dataclass
 class LoadedStepScene:
     step_path: Path
     roots: list["OccurrenceNode"]
@@ -89,7 +83,9 @@ class LoadedStepScene:
     load_elapsed: float = 0.0
     step_hash: str | None = None
     mesh_signature: tuple[float, float, bool] | None = None
+    glb_mesh_payloads: dict[tuple[object, ...], Any] = field(default_factory=dict)
     export_shape: Any | None = None
+    doc: Any | None = None
 
 
 @dataclass
@@ -402,6 +398,7 @@ def _extract_face_geometry(face: Any) -> dict[str, Any]:
     if triangulation is None:
         return {
             "nodes": [],
+            "normals": [],
             "triangles": [],
             "triangleCount": 0,
             "area": 0.0,
@@ -412,7 +409,14 @@ def _extract_face_geometry(face: Any) -> dict[str, Any]:
             "location": location,
         }
 
+    if not triangulation.HasNormals():
+        triangulation.ComputeNormals()
+    reversed_face = face.Orientation() == TopAbs_REVERSED
     nodes = [_transform_point_from_occ(triangulation.Node(index), location) for index in range(1, triangulation.NbNodes() + 1)]
+    normals = [
+        _transform_normal_from_occ(triangulation.Normal(index), location, reversed_face=reversed_face)
+        for index in range(1, triangulation.NbNodes() + 1)
+    ]
     triangles: list[tuple[int, int, int]] = []
     area_sum = 0.0
     centroid_sum = [0.0, 0.0, 0.0]
@@ -425,7 +429,10 @@ def _extract_face_geometry(face: Any) -> dict[str, Any]:
         point_c = nodes[node_c - 1]
         normal_x, normal_y, normal_z = _cross(point_a, point_b, point_c)
         twice_area = math.sqrt((normal_x * normal_x) + (normal_y * normal_y) + (normal_z * normal_z))
-        if twice_area <= 1e-12:
+        # GLB export filters in meters with a 1e-15 twice-area floor. Selector
+        # extraction stores CAD units, so use the equivalent millimeter-scale
+        # threshold to keep v3 face runs aligned with GLB primitive triangles.
+        if twice_area <= 1e-9:
             continue
         area = twice_area * 0.5
         centroid_sum[0] += (point_a[0] + point_b[0] + point_c[0]) * area / 3.0
@@ -435,7 +442,10 @@ def _extract_face_geometry(face: Any) -> dict[str, Any]:
         normal_sum[1] += normal_y
         normal_sum[2] += normal_z
         area_sum += area
-        triangles.append((node_a - 1, node_b - 1, node_c - 1))
+        triangle = [node_a - 1, node_b - 1, node_c - 1]
+        if reversed_face:
+            triangle[1], triangle[2] = triangle[2], triangle[1]
+        triangles.append((triangle[0], triangle[1], triangle[2]))
 
     if not nodes:
         center = [0.0, 0.0, 0.0]
@@ -449,11 +459,12 @@ def _extract_face_geometry(face: Any) -> dict[str, Any]:
         center = _bbox_from_points(nodes)["center"]
 
     normal = _normalize((normal_sum[0], normal_sum[1], normal_sum[2]))
-    if normal and face.Orientation() == TopAbs_REVERSED:
+    if normal and reversed_face:
         normal = [-normal[0], -normal[1], -normal[2]]
 
     return {
         "nodes": nodes,
+        "normals": normals,
         "triangles": triangles,
         "triangleCount": len(triangles),
         "area": area_sum,
@@ -534,10 +545,6 @@ def _edge_flags(edge_data: dict[str, Any]) -> int:
     return flags
 
 
-def _vertex_flags(vertex_data: dict[str, Any]) -> int:
-    return 1 if not vertex_data.get("referenceable", True) else 0
-
-
 def _shape_hash(shape: Any) -> int:
     return hash(shape)
 
@@ -571,6 +578,16 @@ def _located_shape(topods_shape: object, location: object | None) -> object:
         return topods_shape
     try:
         return located(location)
+    except Exception:
+        return topods_shape
+
+
+def _unlocated_shape(topods_shape: object) -> object:
+    located = getattr(topods_shape, "Located", None)
+    if not callable(located):
+        return topods_shape
+    try:
+        return located(TopLoc_Location())
     except Exception:
         return topods_shape
 
@@ -724,10 +741,18 @@ def _xcaf_children(shape_tool: Any, label: object, resolved_label: object) -> li
 
 def _load_occurrence_tree(
     step_path: Path,
-) -> tuple[list[OccurrenceNode], dict[int, Any], dict[int, str | None], dict[int, ColorRGBA], dict[int, dict[int, ColorRGBA]]]:
+) -> tuple[
+    list[OccurrenceNode],
+    dict[int, Any],
+    dict[int, str | None],
+    dict[int, ColorRGBA],
+    dict[int, dict[int, ColorRGBA]],
+    Any | None,
+]:
     app = XCAFApp_Application.GetApplication_s()
-    doc = TDocStd_Document(TCollection_ExtendedString("step-selectors"))
-    app.NewDocument(TCollection_ExtendedString("MDTV-XCAF"), doc)
+    BinXCAFDrivers.DefineFormat_s(app)
+    doc = TDocStd_Document(TCollection_ExtendedString("BinXCAF"))
+    app.NewDocument(TCollection_ExtendedString("BinXCAF"), doc)
 
     reader = STEPCAFControl_Reader()
     reader.SetColorMode(True)
@@ -738,16 +763,33 @@ def _load_occurrence_tree(
             mode(True)
     read_status = reader.ReadFile(str(step_path))
     if int(read_status) != int(IFSelect_RetDone):
-        return _load_fallback_occurrence_tree(step_path)
+        return (*_load_fallback_occurrence_tree(step_path), None)
     if not reader.Transfer(doc):
-        return _load_fallback_occurrence_tree(step_path)
+        return (*_load_fallback_occurrence_tree(step_path), None)
+
+    loaded = _load_occurrence_tree_from_xcaf_doc(step_path, doc)
+    if loaded is None:
+        return (*_load_fallback_occurrence_tree(step_path), None)
+    return (*loaded, doc)
+
+
+def _load_occurrence_tree_from_xcaf_doc(
+    step_path: Path,
+    doc: Any,
+) -> tuple[
+    list[OccurrenceNode],
+    dict[int, Any],
+    dict[int, str | None],
+    dict[int, ColorRGBA],
+    dict[int, dict[int, ColorRGBA]],
+] | None:
 
     shape_tool = XCAFDoc_DocumentTool.ShapeTool_s(doc.Main())
     color_tool = XCAFDoc_DocumentTool.ColorTool_s(doc.Main())
     free_labels = TDF_LabelSequence()
     shape_tool.GetFreeShapes(free_labels)
     if free_labels.Length() <= 0:
-        return _load_fallback_occurrence_tree(step_path)
+        return None
 
     prototypes: dict[int, Any] = {}
     prototype_names: dict[int, str | None] = {}
@@ -772,11 +814,13 @@ def _load_occurrence_tree(
         )
         prototype_key: int | None = None
         if not children and not resolved_shape.IsNull():
-            prototype_key = _shape_hash(resolved_shape)
-            prototypes.setdefault(prototype_key, resolved_shape)
+            prototype_shape = _unlocated_shape(resolved_shape)
+            prototype_key = _shape_hash(prototype_shape)
+            prototypes.setdefault(prototype_key, prototype_shape)
         elif not children and not base_shape.IsNull():
-            prototype_key = _shape_hash(base_shape)
-            prototypes.setdefault(prototype_key, base_shape)
+            prototype_shape = _unlocated_shape(base_shape)
+            prototype_key = _shape_hash(prototype_shape)
+            prototypes.setdefault(prototype_key, prototype_shape)
         if prototype_key is not None:
             prototype_names.setdefault(prototype_key, source_name or name)
             prototype_color = _color_from_label(color_tool, resolved_label) or _color_from_shape(color_tool, resolved_shape)
@@ -812,8 +856,40 @@ def _load_occurrence_tree(
         if (node := collect(free_labels.Value(index), path=(index,))) is not None
     ]
     if not roots:
-        return _load_fallback_occurrence_tree(step_path)
+        return None
     return roots, prototypes, prototype_names, prototype_colors, prototype_face_colors
+
+
+def load_step_scene_from_xcaf_doc(
+    step_path: Path,
+    doc: Any,
+    *,
+    step_hash: str | None = None,
+    load_elapsed: float | None = None,
+) -> LoadedStepScene:
+    resolved_step_path = step_path.expanduser().resolve()
+    load_started = time.perf_counter()
+    loaded = _load_occurrence_tree_from_xcaf_doc(resolved_step_path, doc)
+    if loaded is None:
+        raise RuntimeError(f"XCAF document contains no STEP geometry: {resolved_step_path}")
+    (
+        roots,
+        prototype_shapes,
+        prototype_names,
+        prototype_colors,
+        prototype_face_colors,
+    ) = loaded
+    return LoadedStepScene(
+        step_path=resolved_step_path,
+        roots=roots,
+        prototype_shapes=prototype_shapes,
+        prototype_names=prototype_names,
+        prototype_colors=prototype_colors,
+        prototype_face_colors=prototype_face_colors,
+        load_elapsed=time.perf_counter() - load_started if load_elapsed is None else load_elapsed,
+        step_hash=step_hash,
+        doc=doc,
+    )
 
 
 def _load_fallback_occurrence_tree(
@@ -852,7 +928,14 @@ def load_step_scene(step_path: Path) -> LoadedStepScene:
     if not resolved_step_path.exists():
         raise FileNotFoundError(f"STEP file does not exist: {resolved_step_path}")
     load_started = time.perf_counter()
-    roots, prototype_shapes, prototype_names, prototype_colors, prototype_face_colors = _load_occurrence_tree(resolved_step_path)
+    (
+        roots,
+        prototype_shapes,
+        prototype_names,
+        prototype_colors,
+        prototype_face_colors,
+        doc,
+    ) = _load_occurrence_tree(resolved_step_path)
     return LoadedStepScene(
         step_path=resolved_step_path,
         roots=roots,
@@ -861,6 +944,7 @@ def load_step_scene(step_path: Path) -> LoadedStepScene:
         prototype_colors=prototype_colors,
         prototype_face_colors=prototype_face_colors,
         load_elapsed=time.perf_counter() - load_started,
+        doc=doc,
     )
 
 
@@ -971,19 +1055,6 @@ def _edge_ordinals_from_shape(shape: Any, edge_ord_by_hash: dict[int, int]) -> l
     return ordinals
 
 
-def _vertex_ordinals_from_shape(shape: Any, vertex_ord_by_hash: dict[int, int]) -> list[int]:
-    explorer = TopExp_Explorer(shape, TopAbs_VERTEX)
-    ordinals: list[int] = []
-    seen: set[int] = set()
-    while explorer.More():
-        ordinal = vertex_ord_by_hash.get(_shape_hash(explorer.Current()))
-        if ordinal is not None and ordinal not in seen:
-            ordinals.append(ordinal)
-            seen.add(ordinal)
-        explorer.Next()
-    return ordinals
-
-
 def _prototype_shape_entries(root_shape: Any) -> tuple[str, list[dict[str, Any]], dict[int, int], dict[int, int]]:
     solid_map = TopTools_IndexedMapOfShape()
     shell_map = TopTools_IndexedMapOfShape()
@@ -1016,10 +1087,8 @@ def _prototype_shape_entries(root_shape: Any) -> tuple[str, list[dict[str, Any]]
 def _extract_summary_prototype(root_shape: Any, options: SelectorOptions) -> dict[str, Any]:
     face_map = TopTools_IndexedMapOfShape()
     edge_map = TopTools_IndexedMapOfShape()
-    vertex_map = TopTools_IndexedMapOfShape()
     TopExp.MapShapes_s(root_shape, TopAbs_FACE, face_map)
     TopExp.MapShapes_s(root_shape, TopAbs_EDGE, edge_map)
-    TopExp.MapShapes_s(root_shape, TopAbs_VERTEX, vertex_map)
     kind, shape_entries, _face_to_shape, _edge_to_shape = _prototype_shape_entries(root_shape)
     return {
         "kind": kind,
@@ -1027,7 +1096,6 @@ def _extract_summary_prototype(root_shape: Any, options: SelectorOptions) -> dic
         "shapeCount": len(shape_entries) if shape_entries else 0,
         "faceCount": face_map.Extent(),
         "edgeCount": edge_map.Extent(),
-        "vertexCount": vertex_map.Extent(),
     }
 
 
@@ -1049,13 +1117,10 @@ def _extract_refs_prototype(
 
     face_map = TopTools_IndexedMapOfShape()
     edge_map = TopTools_IndexedMapOfShape()
-    vertex_map = TopTools_IndexedMapOfShape()
     TopExp.MapShapes_s(root_shape, TopAbs_FACE, face_map)
     TopExp.MapShapes_s(root_shape, TopAbs_EDGE, edge_map)
-    TopExp.MapShapes_s(root_shape, TopAbs_VERTEX, vertex_map)
     face_ord_by_hash = {_shape_hash(face_map.FindKey(index)): index for index in range(1, face_map.Extent() + 1)}
     edge_ord_by_hash = {_shape_hash(edge_map.FindKey(index)): index for index in range(1, edge_map.Extent() + 1)}
-    vertex_ord_by_hash = {_shape_hash(vertex_map.FindKey(index)): index for index in range(1, vertex_map.Extent() + 1)}
 
     kind, shape_entries, _face_to_shape, _edge_to_shape = _prototype_shape_entries(root_shape)
     if not shape_entries and (face_map.Extent() > 0 or edge_map.Extent() > 0):
@@ -1063,37 +1128,24 @@ def _extract_refs_prototype(
 
     shape_local_by_face: dict[int, int] = {}
     shape_local_by_edge: dict[int, int] = {}
-    shape_local_by_vertex: dict[int, int] = {}
     for shape_entry in shape_entries:
         face_ordinals = _face_ordinals_from_shape(shape_entry["shape"], face_ord_by_hash)
         edge_ordinals = _edge_ordinals_from_shape(shape_entry["shape"], edge_ord_by_hash)
-        vertex_ordinals = _vertex_ordinals_from_shape(shape_entry["shape"], vertex_ord_by_hash)
         shape_entry["faceOrdinals"] = face_ordinals
         shape_entry["edgeOrdinals"] = edge_ordinals
-        shape_entry["vertexOrdinals"] = vertex_ordinals
         for ordinal in face_ordinals:
             shape_local_by_face.setdefault(ordinal, shape_entry["ordinal"])
         for ordinal in edge_ordinals:
             shape_local_by_edge.setdefault(ordinal, shape_entry["ordinal"])
-        for ordinal in vertex_ordinals:
-            shape_local_by_vertex.setdefault(ordinal, shape_entry["ordinal"])
 
     face_edge_ordinals: dict[int, list[int]] = {}
     edge_face_ordinals: dict[int, list[int]] = {}
-    edge_vertex_ordinals: dict[int, list[int]] = {}
-    vertex_edge_ordinals: dict[int, list[int]] = {}
     for face_ordinal in range(1, face_map.Extent() + 1):
         face = TopoDS.Face_s(face_map.FindKey(face_ordinal))
         edge_ordinals = _edge_ordinals_from_shape(face, edge_ord_by_hash)
         face_edge_ordinals[face_ordinal] = edge_ordinals
         for edge_ordinal in edge_ordinals:
             edge_face_ordinals.setdefault(edge_ordinal, []).append(face_ordinal)
-    for edge_ordinal in range(1, edge_map.Extent() + 1):
-        edge = TopoDS.Edge_s(edge_map.FindKey(edge_ordinal))
-        vertex_ordinals = _vertex_ordinals_from_shape(edge, vertex_ord_by_hash)
-        edge_vertex_ordinals[edge_ordinal] = vertex_ordinals
-        for vertex_ordinal in vertex_ordinals:
-            vertex_edge_ordinals.setdefault(vertex_ordinal, []).append(edge_ordinal)
 
     face_boxes: dict[int, dict[str, Any]] = {}
     face_meshes: dict[int, dict[str, Any]] = {}
@@ -1109,6 +1161,7 @@ def _extract_refs_prototype(
         face_data = {
             "ordinal": face_ordinal,
             "shapeOrdinal": shape_local_by_face.get(face_ordinal, 1),
+            "shapeHash": _shape_hash(face),
             "surfaceType": _enum_name(surface.GetType(), "GeomAbs_"),
             "area": geometry["area"],
             "center": geometry["center"],
@@ -1116,6 +1169,7 @@ def _extract_refs_prototype(
             "bbox": geometry["bbox"],
             "edgeOrdinals": tuple(face_edge_ordinals.get(face_ordinal, [])),
             "triangleNodes": geometry["nodes"],
+            "triangleNormals": geometry["normals"],
             "triangles": geometry["triangles"],
         }
         if not (geometry["triangleCount"] > 0 and geometry["area"] > 1e-12):
@@ -1158,7 +1212,6 @@ def _extract_refs_prototype(
             "center": _polyline_center(points),
             "bbox": bbox,
             "faceOrdinals": tuple(edge_face_ordinals.get(edge_ordinal, [])),
-            "vertexOrdinals": tuple(edge_vertex_ordinals.get(edge_ordinal, [])),
             "points": points,
         }
         if closed:
@@ -1207,32 +1260,6 @@ def _extract_refs_prototype(
         edge_data["relevance"] = max(0, min(100, int(round(score))))
         edge_data["flags"] = _edge_flags(edge_data)
 
-    vertices: list[dict[str, Any]] = []
-    for vertex_ordinal in range(1, vertex_map.Extent() + 1):
-        vertex = TopoDS.Vertex_s(vertex_map.FindKey(vertex_ordinal))
-        point = _point_from_occ(BRep_Tool.Pnt_s(vertex))
-        edge_ordinals = tuple(vertex_edge_ordinals.get(vertex_ordinal, []))
-        referenceable_edge_count = sum(
-            1
-            for edge_ordinal in edge_ordinals
-            if 1 <= edge_ordinal <= len(edges) and edges[edge_ordinal - 1].get("referenceable", True)
-        )
-        vertex_data = {
-            "ordinal": vertex_ordinal,
-            "shapeOrdinal": shape_local_by_vertex.get(vertex_ordinal, 1),
-            "center": point,
-            "bbox": _bbox_from_points([point]),
-            "edgeOrdinals": edge_ordinals,
-        }
-        if referenceable_edge_count < 2:
-            vertex_data["referenceable"] = False
-        score = 55.0 + (10.0 * min(referenceable_edge_count, 4))
-        if not vertex_data.get("referenceable", True):
-            score = 0.0
-        vertex_data["relevance"] = max(0, min(100, int(round(score))))
-        vertex_data["flags"] = _vertex_flags(vertex_data)
-        vertices.append(vertex_data)
-
     for shape_entry in shape_entries:
         shape = shape_entry["shape"]
         face_ordinals = shape_entry.get("faceOrdinals", [])
@@ -1254,11 +1281,9 @@ def _extract_refs_prototype(
         "shapeCount": len(shape_entries),
         "faceCount": len(faces),
         "edgeCount": len(edges),
-        "vertexCount": len(vertices),
         "shapes": shape_entries,
         "faces": faces,
         "edges": edges,
-        "vertices": vertices,
         "includeBuffers": include_buffers,
     }
 
@@ -1290,22 +1315,8 @@ def _step_hash(step_path: Path) -> str:
     return digest.hexdigest()
 
 
-def _write_binary_bundle(output_path: Path, buffers: dict[str, array]) -> tuple[Path, dict[str, Any]]:
-    bin_path = output_path.with_suffix(".bin")
-    views: dict[str, Any] = {}
-    offset = 0
-    with bin_path.open("wb") as handle:
-        for name, values in buffers.items():
-            raw = values.tobytes()
-            handle.write(raw)
-            views[name] = {
-                "dtype": "float32" if values.typecode == "f" else "uint32",
-                "offset": offset,
-                "count": len(values),
-                "itemSize": values.itemsize,
-            }
-            offset += len(raw)
-    return bin_path, views
+def step_file_hash(step_path: Path) -> str:
+    return _step_hash(step_path.expanduser().resolve())
 
 
 def _normalize_selector_options(options: SelectorOptions | None) -> SelectorOptions:
@@ -1346,6 +1357,8 @@ def extract_selectors_from_scene(
     cad_ref: str | None = None,
     profile: SelectorProfile = SelectorProfile.ARTIFACT,
     options: SelectorOptions | None = None,
+    color: ColorRGBA | tuple[float, ...] | None = None,
+    occurrence_colors: dict[str, ColorRGBA] | None = None,
 ) -> SelectorBundle:
     started = time.perf_counter()
     resolved_step_path = scene.step_path
@@ -1375,6 +1388,11 @@ def extract_selectors_from_scene(
     load_elapsed = scene.load_elapsed
 
     roots = scene.roots
+    override_color = None if color is None else _normalize_rgba(color)
+    normalized_occurrence_colors = {
+        str(key): _normalize_rgba(value)
+        for key, value in (occurrence_colors or {}).items()
+    }
 
     occurrence_columns = [
         "id",
@@ -1390,8 +1408,6 @@ def extract_selectors_from_scene(
         "faceCount",
         "edgeStart",
         "edgeCount",
-        "vertexStart",
-        "vertexCount",
     ]
     shape_columns = [
         "id",
@@ -1406,8 +1422,6 @@ def extract_selectors_from_scene(
         "faceCount",
         "edgeStart",
         "edgeCount",
-        "vertexStart",
-        "vertexCount",
     ]
     face_columns = [
         "id",
@@ -1438,52 +1452,30 @@ def extract_selectors_from_scene(
         "bbox",
         "faceStart",
         "faceCount",
-        "vertexStart",
-        "vertexCount",
         "relevance",
         "flags",
         "params",
         "segmentStart",
         "segmentCount",
     ]
-    vertex_columns = [
-        "id",
-        "occurrenceId",
-        "shapeId",
-        "ordinal",
-        "center",
-        "bbox",
-        "edgeStart",
-        "edgeCount",
-        "relevance",
-        "flags",
-    ]
 
     occurrence_rows: list[list[Any]] = []
     shape_rows: list[list[Any]] = []
     face_rows: list[list[Any]] = []
     edge_rows: list[list[Any]] = []
-    vertex_rows: list[list[Any]] = []
 
     face_edge_rows = array("I")
     edge_face_rows = array("I")
-    edge_vertex_rows = array("I")
-    vertex_edge_rows = array("I")
-    face_proxy_positions = array("f")
-    face_proxy_indices = array("I")
-    face_proxy_ids = array("I")
+    face_proxy_runs = array("I")
     edge_proxy_positions = array("f")
     edge_proxy_indices = array("I")
     edge_proxy_ids = array("I")
-    vertex_proxy_positions = array("f")
-    vertex_proxy_ids = array("I")
 
     entry_bbox_boxes: list[dict[str, Any]] = []
     leaf_occurrence_count = 0
     summary_shape_count = 0
     summary_face_count = 0
     summary_edge_count = 0
-    summary_vertex_count = 0
 
     def append_occurrence_row(node: OccurrenceNode) -> str:
         occurrence_id = _selector_id(node.path)
@@ -1504,8 +1496,6 @@ def extract_selectors_from_scene(
                 0,
                 0,
                 0,
-                0,
-                0,
             ]
         )
         return occurrence_id
@@ -1518,23 +1508,52 @@ def extract_selectors_from_scene(
         occurrence_rows[node.row_index][10] = ranges["faceCount"]
         occurrence_rows[node.row_index][11] = ranges["edgeStart"]
         occurrence_rows[node.row_index][12] = ranges["edgeCount"]
-        occurrence_rows[node.row_index][13] = ranges["vertexStart"]
-        occurrence_rows[node.row_index][14] = ranges["vertexCount"]
+
+    def glb_default_color_for_node(node: OccurrenceNode, occurrence_id: str) -> tuple[ColorRGBA, bool]:
+        if override_color is not None:
+            return override_color, True
+        occurrence_color = _occurrence_color_for_id(occurrence_id, normalized_occurrence_colors)
+        if occurrence_color is not None:
+            return occurrence_color, True
+        if node.color is not None:
+            return _normalize_rgba(node.color), False
+        if node.prototype_key is not None and node.prototype_key in scene.prototype_colors:
+            return _normalize_rgba(scene.prototype_colors[node.prototype_key]), False
+        return DEFAULT_TOPOLOGY_MATERIAL, False
+
+    def glb_face_runs_for_node(
+        node: OccurrenceNode,
+        occurrence_id: str,
+        prototype: dict[str, Any],
+    ) -> dict[int, tuple[int, int, int]]:
+        if node.prototype_key is None:
+            return {}
+        default_color, suppress_face_colors = glb_default_color_for_node(node, occurrence_id)
+        payload = scene_glb_mesh_payload(
+            scene,
+            node.prototype_key,
+            default_color=default_color,
+            suppress_face_colors=suppress_face_colors,
+            prototype=prototype,
+        )
+        runs: dict[int, tuple[int, int, int]] = {}
+        for face_entry in prototype.get("faces", []):
+            face_hash = int(face_entry.get("shapeHash") or 0)
+            runs[int(face_entry["ordinal"])] = payload.face_runs_by_hash.get(face_hash, (0, 0, 0))
+        return runs
 
     def emit_leaf(node: OccurrenceNode, occurrence_id: str, prototype: dict[str, Any]) -> dict[str, Any]:
-        nonlocal leaf_occurrence_count, summary_shape_count, summary_face_count, summary_edge_count, summary_vertex_count
+        nonlocal leaf_occurrence_count, summary_shape_count, summary_face_count, summary_edge_count
         leaf_occurrence_count += 1
 
         start_shape = len(shape_rows)
         start_face = len(face_rows)
         start_edge = len(edge_rows)
-        start_vertex = len(vertex_rows)
 
         if profile == SelectorProfile.SUMMARY:
             summary_shape_count += int(prototype.get("shapeCount") or 0)
             summary_face_count += int(prototype.get("faceCount") or 0)
             summary_edge_count += int(prototype.get("edgeCount") or 0)
-            summary_vertex_count += int(prototype.get("vertexCount") or 0)
             bbox = _transform_bbox(prototype["bbox"], node.transform)
             entry_bbox_boxes.append(bbox)
             return {
@@ -1545,8 +1564,6 @@ def extract_selectors_from_scene(
                 "faceCount": int(prototype.get("faceCount") or 0),
                 "edgeStart": 0,
                 "edgeCount": int(prototype.get("edgeCount") or 0),
-                "vertexStart": 0,
-                "vertexCount": int(prototype.get("vertexCount") or 0),
             }
 
         local_shape_index_to_global_row: dict[int, int] = {}
@@ -1566,8 +1583,6 @@ def extract_selectors_from_scene(
                     len(shape_entry.get("faceOrdinals", [])),
                     0,
                     len(shape_entry.get("edgeOrdinals", [])),
-                    0,
-                    len(shape_entry.get("vertexOrdinals", [])),
                 ]
             )
 
@@ -1616,8 +1631,6 @@ def extract_selectors_from_scene(
                     _compact_bbox(_transform_bbox(edge_entry["bbox"], node.transform), normalized_options.digits),
                     face_start,
                     len(edge_entry["faceOrdinals"]),
-                    0,
-                    len(edge_entry.get("vertexOrdinals", [])),
                     int(edge_entry.get("relevance", 0)),
                     int(edge_entry.get("flags", 0)),
                     None
@@ -1625,24 +1638,6 @@ def extract_selectors_from_scene(
                     else _transform_param_dict(edge_entry["params"], node.transform, normalized_options.digits),
                     0,
                     0,
-                ]
-            )
-
-        local_vertex_index_to_global_row: dict[int, int] = {}
-        for vertex_entry in prototype.get("vertices", []):
-            local_vertex_index_to_global_row[int(vertex_entry["ordinal"])] = len(vertex_rows)
-            vertex_rows.append(
-                [
-                    f"{occurrence_id}.v{vertex_entry['ordinal']}",
-                    occurrence_id,
-                    f"{occurrence_id}.s{vertex_entry['shapeOrdinal']}",
-                    int(vertex_entry["ordinal"]),
-                    _round_point(_apply_transform_point(node.transform, vertex_entry["center"]), normalized_options.digits),
-                    _compact_bbox(_transform_bbox(vertex_entry["bbox"], node.transform), normalized_options.digits),
-                    0,
-                    len(vertex_entry["edgeOrdinals"]),
-                    int(vertex_entry.get("relevance", 0)),
-                    int(vertex_entry.get("flags", 0)),
                 ]
             )
 
@@ -1656,13 +1651,8 @@ def extract_selectors_from_scene(
                 first_edge_global = local_edge_index_to_global_row[shape_entry["edgeOrdinals"][0]]
             else:
                 first_edge_global = len(edge_rows)
-            if shape_entry.get("vertexOrdinals"):
-                first_vertex_global = local_vertex_index_to_global_row[shape_entry["vertexOrdinals"][0]]
-            else:
-                first_vertex_global = len(vertex_rows)
             shape_rows[global_shape_row][8] = first_face_global
             shape_rows[global_shape_row][10] = first_edge_global
-            shape_rows[global_shape_row][12] = first_vertex_global
 
         for face_entry in prototype.get("faces", []):
             global_face_row = local_face_index_to_global_row[int(face_entry["ordinal"])]
@@ -1674,34 +1664,25 @@ def extract_selectors_from_scene(
         for edge_entry in prototype.get("edges", []):
             global_edge_row = local_edge_index_to_global_row[int(edge_entry["ordinal"])]
             face_start = len(edge_face_rows)
-            vertex_start = len(edge_vertex_rows)
             edge_rows[global_edge_row][8] = face_start
-            edge_rows[global_edge_row][10] = vertex_start
             for face_ordinal in edge_entry["faceOrdinals"]:
                 edge_face_rows.append(local_face_index_to_global_row[int(face_ordinal)])
-            for vertex_ordinal in edge_entry.get("vertexOrdinals", []):
-                edge_vertex_rows.append(local_vertex_index_to_global_row[int(vertex_ordinal)])
-
-        for vertex_entry in prototype.get("vertices", []):
-            global_vertex_row = local_vertex_index_to_global_row[int(vertex_entry["ordinal"])]
-            edge_start = len(vertex_edge_rows)
-            vertex_rows[global_vertex_row][6] = edge_start
-            for edge_ordinal in vertex_entry["edgeOrdinals"]:
-                vertex_edge_rows.append(local_edge_index_to_global_row[int(edge_ordinal)])
 
         if profile == SelectorProfile.ARTIFACT:
+            face_runs = glb_face_runs_for_node(node, occurrence_id, prototype)
             for face_entry in prototype.get("faces", []):
                 global_face_row = local_face_index_to_global_row[int(face_entry["ordinal"])]
-                vertex_offset = len(face_proxy_positions) // 3
-                triangle_start = len(face_proxy_ids)
-                for point in face_entry["triangleNodes"]:
-                    transformed = _apply_transform_point(node.transform, point)
-                    face_proxy_positions.extend(_round_point(transformed, normalized_options.digits))
-                for node_a, node_b, node_c in face_entry["triangles"]:
-                    face_proxy_indices.extend([vertex_offset + node_a, vertex_offset + node_b, vertex_offset + node_c])
-                    face_proxy_ids.append(global_face_row)
+                primitive_index, triangle_start, triangle_count = face_runs.get(int(face_entry["ordinal"]), (0, 0, 0))
                 face_rows[global_face_row][14] = triangle_start
-                face_rows[global_face_row][15] = len(face_entry["triangles"])
+                face_rows[global_face_row][15] = triangle_count
+                if triangle_count > 0:
+                    face_proxy_runs.extend([
+                        int(node.row_index),
+                        int(primitive_index),
+                        int(triangle_start),
+                        int(triangle_count),
+                        int(global_face_row),
+                    ])
 
             for edge_entry in prototype.get("edges", []):
                 global_edge_row = local_edge_index_to_global_row[int(edge_entry["ordinal"])]
@@ -1719,14 +1700,8 @@ def extract_selectors_from_scene(
                 if edge_entry.get("closed", False) and _distance(points[0], points[-1]) > 1e-9:
                     edge_proxy_indices.extend([vertex_offset + len(points) - 1, vertex_offset])
                     edge_proxy_ids.append(global_edge_row)
-                edge_rows[global_edge_row][15] = segment_start
-                edge_rows[global_edge_row][16] = len(edge_proxy_ids) - segment_start
-
-            for vertex_entry in prototype.get("vertices", []):
-                global_vertex_row = local_vertex_index_to_global_row[int(vertex_entry["ordinal"])]
-                point = _apply_transform_point(node.transform, vertex_entry["center"])
-                vertex_proxy_positions.extend(_round_point(point, normalized_options.digits))
-                vertex_proxy_ids.append(global_vertex_row)
+                edge_rows[global_edge_row][13] = segment_start
+                edge_rows[global_edge_row][14] = len(edge_proxy_ids) - segment_start
 
         bbox = _transform_bbox(prototype["bbox"], node.transform)
         entry_bbox_boxes.append(bbox)
@@ -1738,8 +1713,6 @@ def extract_selectors_from_scene(
             "faceCount": len(face_rows) - start_face,
             "edgeStart": start_edge,
             "edgeCount": len(edge_rows) - start_edge,
-            "vertexStart": start_vertex,
-            "vertexCount": len(vertex_rows) - start_vertex,
         }
 
     def emit_node(node: OccurrenceNode) -> dict[str, Any]:
@@ -1747,12 +1720,10 @@ def extract_selectors_from_scene(
         shape_start = len(shape_rows)
         face_start = len(face_rows)
         edge_start = len(edge_rows)
-        vertex_start = len(vertex_rows)
         child_boxes: list[dict[str, Any]] = []
         aggregated_shape_count = 0
         aggregated_face_count = 0
         aggregated_edge_count = 0
-        aggregated_vertex_count = 0
 
         if node.prototype_key is not None:
             leaf_result = emit_leaf(node, occurrence_id, prototypes[node.prototype_key])
@@ -1760,7 +1731,6 @@ def extract_selectors_from_scene(
             aggregated_shape_count += int(leaf_result["shapeCount"])
             aggregated_face_count += int(leaf_result["faceCount"])
             aggregated_edge_count += int(leaf_result["edgeCount"])
-            aggregated_vertex_count += int(leaf_result["vertexCount"])
 
         for child in node.children:
             child_result = emit_node(child)
@@ -1768,7 +1738,6 @@ def extract_selectors_from_scene(
             aggregated_shape_count += int(child_result["shapeCount"])
             aggregated_face_count += int(child_result["faceCount"])
             aggregated_edge_count += int(child_result["edgeCount"])
-            aggregated_vertex_count += int(child_result["vertexCount"])
 
         bbox = _merge_bbox(child_boxes) if child_boxes else _bbox_from_points([])
         ranges = {
@@ -1778,8 +1747,6 @@ def extract_selectors_from_scene(
             "faceCount": aggregated_face_count if profile == SelectorProfile.SUMMARY else len(face_rows) - face_start,
             "edgeStart": edge_start if profile != SelectorProfile.SUMMARY else 0,
             "edgeCount": aggregated_edge_count if profile == SelectorProfile.SUMMARY else len(edge_rows) - edge_start,
-            "vertexStart": vertex_start if profile != SelectorProfile.SUMMARY else 0,
-            "vertexCount": aggregated_vertex_count if profile == SelectorProfile.SUMMARY else len(vertex_rows) - vertex_start,
         }
         finalize_occurrence_row(node, bbox, ranges)
         return {"bbox": bbox, **ranges}
@@ -1796,12 +1763,9 @@ def extract_selectors_from_scene(
         "shapeCount": summary_shape_count if profile == SelectorProfile.SUMMARY else len(shape_rows),
         "faceCount": summary_face_count if profile == SelectorProfile.SUMMARY else len(face_rows),
         "edgeCount": summary_edge_count if profile == SelectorProfile.SUMMARY else len(edge_rows),
-        "vertexCount": summary_vertex_count if profile == SelectorProfile.SUMMARY else len(vertex_rows),
-        "faceProxyVertexCount": len(face_proxy_positions) // 3 if profile == SelectorProfile.ARTIFACT else 0,
-        "faceProxyTriangleCount": len(face_proxy_ids) if profile == SelectorProfile.ARTIFACT else 0,
-        "edgeProxyVertexCount": len(edge_proxy_positions) // 3 if profile == SelectorProfile.ARTIFACT else 0,
+        "faceProxyRunCount": len(face_proxy_runs) // 5 if profile == SelectorProfile.ARTIFACT else 0,
+        "edgeProxyPointCount": len(edge_proxy_positions) // 3 if profile == SelectorProfile.ARTIFACT else 0,
         "edgeProxySegmentCount": len(edge_proxy_ids) if profile == SelectorProfile.ARTIFACT else 0,
-        "vertexProxyPointCount": len(vertex_proxy_ids) if profile == SelectorProfile.ARTIFACT else 0,
         "timingMs": {
             "load": round(load_elapsed * 1000.0, 1),
             "extract": round(prototype_elapsed * 1000.0, 1),
@@ -1810,7 +1774,7 @@ def extract_selectors_from_scene(
     }
 
     manifest: dict[str, Any] = {
-        "schemaVersion": 2,
+        "schemaVersion": 1 if profile == SelectorProfile.ARTIFACT else 2,
         "profile": profile.value,
         "cadRef": cad_ref,
         "stepPath": _relative_step_path(resolved_step_path),
@@ -1822,99 +1786,42 @@ def extract_selectors_from_scene(
             "shapeColumns": shape_columns,
             "faceColumns": face_columns,
             "edgeColumns": edge_columns,
-            "vertexColumns": vertex_columns,
         },
         "occurrences": occurrence_rows,
         "shapes": shape_rows,
         "faces": face_rows,
         "edges": edge_rows,
-        "vertices": vertex_rows,
     }
 
     if profile != SelectorProfile.SUMMARY:
         if profile == SelectorProfile.ARTIFACT:
             manifest["faceProxy"] = {
-                "positionsView": "facePositions",
-                "indicesView": "faceIndices",
-                "faceIdsView": "faceIds",
+                "source": f".{scene.step_path.name}.glb",
+                "runsView": "faceRuns",
+                "runColumns": ["occurrenceRow", "primitiveIndex", "triangleStart", "triangleCount", "faceRow"],
             }
             manifest["edgeProxy"] = {
                 "positionsView": "edgePositions",
                 "indicesView": "edgeIndices",
                 "edgeIdsView": "edgeIds",
             }
-            manifest["vertexProxy"] = {
-                "positionsView": "vertexPositions",
-                "vertexIdsView": "vertexIds",
-            }
             manifest["relations"] = {
                 "faceEdgeRowsView": "faceEdgeRows",
                 "edgeFaceRowsView": "edgeFaceRows",
-                "edgeVertexRowsView": "edgeVertexRows",
-                "vertexEdgeRowsView": "vertexEdgeRows",
             }
             buffers = {
-                "facePositions": face_proxy_positions,
-                "faceIndices": face_proxy_indices,
-                "faceIds": face_proxy_ids,
+                "faceRuns": face_proxy_runs,
                 "edgePositions": edge_proxy_positions,
                 "edgeIndices": edge_proxy_indices,
                 "edgeIds": edge_proxy_ids,
-                "vertexPositions": vertex_proxy_positions,
-                "vertexIds": vertex_proxy_ids,
                 "faceEdgeRows": face_edge_rows,
                 "edgeFaceRows": edge_face_rows,
-                "edgeVertexRows": edge_vertex_rows,
-                "vertexEdgeRows": vertex_edge_rows,
             }
             return SelectorBundle(manifest=manifest, buffers=buffers)
 
         manifest["relations"] = {
             "faceEdgeRows": list(face_edge_rows),
             "edgeFaceRows": list(edge_face_rows),
-            "edgeVertexRows": list(edge_vertex_rows),
-            "vertexEdgeRows": list(vertex_edge_rows),
         }
 
     return SelectorBundle(manifest=manifest)
-
-
-def extract_selectors(
-    step_path: Path,
-    *,
-    cad_ref: str | None = None,
-    profile: SelectorProfile = SelectorProfile.ARTIFACT,
-    options: SelectorOptions | None = None,
-) -> SelectorBundle:
-    scene = load_step_scene(step_path)
-    return extract_selectors_from_scene(
-        scene,
-        cad_ref=cad_ref,
-        profile=profile,
-        options=options,
-    )
-
-
-def _rewrite_manifest_paths_for_output(manifest: dict[str, Any], output_path: Path) -> None:
-    raw_step_path = manifest.get("stepPath")
-    if isinstance(raw_step_path, str) and raw_step_path.strip():
-        step_path = Path(raw_step_path)
-        resolved_step_path = step_path.resolve() if step_path.is_absolute() else (Path.cwd() / step_path).resolve()
-        manifest["stepPath"] = os.path.relpath(resolved_step_path, start=output_path.parent).replace(os.sep, "/")
-
-
-def write_selector_artifacts(bundle: SelectorBundle, manifest_path: Path) -> Path:
-    output_path = manifest_path.expanduser().resolve()
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    manifest = dict(bundle.manifest)
-    _rewrite_manifest_paths_for_output(manifest, output_path)
-    if bundle.buffers:
-        bin_path, views = _write_binary_bundle(output_path, bundle.buffers)
-        manifest["buffers"] = {
-            "uri": bin_path.name,
-            "littleEndian": sys.byteorder == "little",
-            "views": views,
-        }
-    output_path.write_text(json.dumps(manifest, separators=(",", ":")) + "\n", encoding="utf-8")
-    bundle.manifest = manifest
-    return output_path

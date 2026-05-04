@@ -195,7 +195,7 @@ test("buildSidebarDirectoryTree lists CAD files in their exact source directory"
   );
 });
 
-test("workspace global state persists expanded directories, sidebar state, and URDF entry animation preference", () => {
+test("workspace session state persists expanded directories, unified sidebars, and URDF entry animation preference", () => {
   const originalWindow = globalThis.window;
   globalThis.window = {
     localStorage: createMemoryStorage(),
@@ -209,11 +209,8 @@ test("workspace global state persists expanded directories, sidebar state, and U
       query: "sample",
       expandedDirectoryIds: ["parts", "parts/imports", "parts"],
       sidebarOpen: false,
-      mobileSidebarOpen: true,
-      desktopFileSheetOpen: false,
-      mobileFileSheetOpen: false,
-      desktopLookSheetOpen: false,
-      mobileLookSheetOpen: true,
+      fileSheetOpen: false,
+      lookSheetOpen: true,
       sidebarWidth: 312,
       tabToolsWidth: 344,
       urdfEntryAnimationEnabled: false
@@ -227,15 +224,12 @@ test("workspace global state persists expanded directories, sidebar state, and U
     );
     assert.equal(restoredSession.query, "sample");
     assert.equal(restoredSession.sidebarOpen, false);
-    assert.equal(restoredSession.desktopSidebarOpen, false);
-    assert.equal(restoredSession.mobileSidebarOpen, true);
-    assert.equal(restoredSession.desktopFileSheetOpen, false);
-    assert.equal(restoredSession.mobileFileSheetOpen, false);
-    assert.equal(restoredSession.desktopLookSheetOpen, false);
-    assert.equal(restoredSession.mobileLookSheetOpen, true);
+    assert.equal(restoredSession.fileSheetOpen, false);
+    assert.equal(restoredSession.lookSheetOpen, true);
     assert.equal(restoredSession.sidebarWidth, 312);
     assert.equal(restoredSession.tabToolsWidth, 344);
     assert.equal(restoredSession.urdfEntryAnimationEnabled, false);
+    assert.equal(globalThis.window.localStorage.getItem("cad-explorer:workbench-global:v1"), null);
   } finally {
     if (originalWindow === undefined) {
       delete globalThis.window;
@@ -277,28 +271,28 @@ test("workspace desktop restore preserves collapsed sidebar width preferences", 
   assert.equal(
     restoredSidebarWidthForViewport(
       { sidebarOpen: true, sidebarWidth: 150 },
-      { desktopViewport: true, defaultSidebarWidth: 260, sidebarMinWidth: 150 }
+      { defaultSidebarWidth: 260, sidebarMinWidth: 150 }
     ),
     260
   );
   assert.equal(
     restoredSidebarWidthForViewport(
       { sidebarOpen: false, sidebarWidth: 420 },
-      { desktopViewport: true, defaultSidebarWidth: 260, sidebarMinWidth: 150 }
+      { defaultSidebarWidth: 260, sidebarMinWidth: 150 }
     ),
     420
   );
   assert.equal(
     restoredSidebarWidthForViewport(
       { sidebarOpen: true, sidebarWidth: 420 },
-      { desktopViewport: true, defaultSidebarWidth: 260, sidebarMinWidth: 150 }
+      { defaultSidebarWidth: 260, sidebarMinWidth: 150 }
     ),
     420
   );
   assert.equal(
     restoredSidebarWidthForViewport(
       { sidebarOpen: false, sidebarWidth: 150 },
-      { desktopViewport: false, defaultSidebarWidth: 260, sidebarMinWidth: 150 }
+      { defaultSidebarWidth: 260, sidebarMinWidth: 150 }
     ),
     150
   );
@@ -309,7 +303,7 @@ test("workspace resize sync preserves wider preferred sidebar widths", () => {
   assert.equal(preferredPanelWidthAfterViewportSync(120, 150), 150);
 });
 
-test("workspace global state defaults desktop sheets open and mobile sheets closed", () => {
+test("workspace session state defaults sidebar open and side sheets closed", () => {
   const originalWindow = globalThis.window;
   globalThis.window = {
     localStorage: createMemoryStorage(),
@@ -324,11 +318,45 @@ test("workspace global state defaults desktop sheets open and mobile sheets clos
     });
 
     const restoredSession = readCadWorkspaceSessionState();
-    assert.equal(restoredSession.desktopSidebarOpen, true);
-    assert.equal(restoredSession.desktopFileSheetOpen, true);
-    assert.equal(restoredSession.mobileSidebarOpen, false);
-    assert.equal(restoredSession.mobileFileSheetOpen, false);
+    assert.equal(restoredSession.sidebarOpen, true);
+    assert.equal(restoredSession.fileSheetOpen, false);
+    assert.equal(restoredSession.lookSheetOpen, false);
     assert.equal(restoredSession.urdfEntryAnimationEnabled, false);
+  } finally {
+    if (originalWindow === undefined) {
+      delete globalThis.window;
+    } else {
+      globalThis.window = originalWindow;
+    }
+  }
+});
+
+test("workspace session state migrates legacy desktop/mobile sidebar fields", () => {
+  const originalWindow = globalThis.window;
+  globalThis.window = {
+    localStorage: createMemoryStorage(),
+    sessionStorage: createMemoryStorage()
+  };
+
+  try {
+    globalThis.window.sessionStorage.setItem("cad-explorer:workbench-session:v2", JSON.stringify({
+      version: 2,
+      global: {
+        desktopSidebarOpen: false,
+        desktopFileSheetOpen: true,
+        desktopLookSheetOpen: true
+      },
+      tabs: {
+        selectedKey: "",
+        openOrder: [],
+        byKey: {}
+      }
+    }));
+
+    const restoredSession = readCadWorkspaceSessionState();
+    assert.equal(restoredSession.sidebarOpen, false);
+    assert.equal(restoredSession.fileSheetOpen, true);
+    assert.equal(restoredSession.lookSheetOpen, true);
   } finally {
     if (originalWindow === undefined) {
       delete globalThis.window;

@@ -30,7 +30,6 @@ const CLAUDE_CODE_LOADING_VERBS = Object.freeze([
   "Channelling",
   "Choreographing",
   "Churning",
-  "Clauding",
   "Coalescing",
   "Cogitating",
   "Combobulating",
@@ -191,10 +190,20 @@ const CLAUDE_CODE_LOADING_VERBS = Object.freeze([
   "Zigzagging"
 ]);
 
+function shuffledLoadingVerbs() {
+  const verbs = [...CLAUDE_CODE_LOADING_VERBS];
+  for (let index = verbs.length - 1; index > 0; index -= 1) {
+    const swapIndex = Math.floor(Math.random() * (index + 1));
+    [verbs[index], verbs[swapIndex]] = [verbs[swapIndex], verbs[index]];
+  }
+  return verbs;
+}
+
 export default function ExplorerLoadingOverlay({
   explorerLoading,
   previewMode
 }) {
+  const [loadingVerbs, setLoadingVerbs] = useState(() => shuffledLoadingVerbs());
   const [activeWordIndex, setActiveWordIndex] = useState(0);
   const [spinnerFrameIndex, setSpinnerFrameIndex] = useState(0);
   const [ellipsisFrameIndex, setEllipsisFrameIndex] = useState(0);
@@ -207,12 +216,14 @@ export default function ExplorerLoadingOverlay({
       return undefined;
     }
 
+    const nextLoadingVerbs = shuffledLoadingVerbs();
+    setLoadingVerbs(nextLoadingVerbs);
     setActiveWordIndex(0);
     setSpinnerFrameIndex(0);
     setEllipsisFrameIndex(0);
 
     const verbIntervalId = window.setInterval(() => {
-      setActiveWordIndex((current) => (current + 1) % CLAUDE_CODE_LOADING_VERBS.length);
+      setActiveWordIndex((current) => (current + 1) % nextLoadingVerbs.length);
     }, 900);
 
     const spinnerIntervalId = window.setInterval(() => {
@@ -234,7 +245,7 @@ export default function ExplorerLoadingOverlay({
     return null;
   }
 
-  const activeVerb = CLAUDE_CODE_LOADING_VERBS[activeWordIndex];
+  const activeVerb = loadingVerbs[activeWordIndex] || CLAUDE_CODE_LOADING_VERBS[0];
   const spinnerFrame = ASCII_SPINNER_FRAMES[spinnerFrameIndex];
   const ellipsis = ASCII_ELLIPSIS_FRAMES[ellipsisFrameIndex];
 
@@ -245,7 +256,7 @@ export default function ExplorerLoadingOverlay({
         <div
           role="status"
           aria-live="polite"
-          className="cad-loading-ascii relative z-10 max-w-[min(90vw,38rem)] text-center font-mono text-[13px] text-popover-foreground sm:text-[15px]"
+          className="cad-loading-ascii relative z-10 max-w-[min(90vw,38rem)] text-center font-mono text-sm text-popover-foreground"
         >
           <span className="sr-only">{activeVerb}</span>
           <span className="inline-flex w-[24ch] items-start justify-start text-left sm:w-[26ch]">

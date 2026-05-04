@@ -73,7 +73,20 @@ function buildGlbCadRootCorrection(THREE, scene) {
   return new THREE.Matrix4().copy(children[0].matrixWorld).invert();
 }
 
-function appendGlbPrimitive(THREE, accumulator, mesh, group, material, useSourceColors, rootCorrection) {
+function cadOccurrenceIdForObject(object) {
+  let current = object || null;
+  while (current) {
+    const rawOccurrenceId = String(current.userData?.cadOccurrenceId || "").trim();
+    if (rawOccurrenceId) {
+      return rawOccurrenceId;
+    }
+    current = current.parent || null;
+  }
+  const objectName = String(object?.name || "").trim();
+  return /^o\d+(?:\.\d+)*$/.test(objectName) ? objectName : "";
+}
+
+function appendGlbPrimitive(THREE, accumulator, mesh, group, material, useSourceColors, rootCorrection, primitiveIndex = 0) {
   const geometry = mesh?.geometry;
   const positions = geometry?.getAttribute?.("position");
   if (!positions || positions.itemSize !== 3 || positions.count <= 0) {
@@ -145,11 +158,13 @@ function appendGlbPrimitive(THREE, accumulator, mesh, group, material, useSource
   if (vertexCount <= 0 || triangleCount <= 0) {
     return;
   }
-  const label = String(mesh?.name || mesh?.parent?.name || `glb:${accumulator.parts.length}`).trim();
-  const id = `glb:${accumulator.parts.length}`;
+  const cadOccurrenceId = cadOccurrenceIdForObject(mesh);
+  const label = String(cadOccurrenceId || mesh?.name || mesh?.parent?.name || `glb:${accumulator.parts.length}`).trim();
+  const id = cadOccurrenceId || `glb:${accumulator.parts.length}`;
   accumulator.parts.push({
     id,
     occurrenceId: id,
+    primitiveIndex: Math.max(0, Math.floor(Number(primitiveIndex) || 0)),
     name: label || id,
     label: label || id,
     nodeType: "part",
@@ -178,14 +193,17 @@ function buildMeshDataFromGltf(THREE, gltf) {
     parts: [],
     colorSet: new Set(),
   };
+  const nextPrimitiveIndexByOccurrence = new Map();
   gltf?.scene?.traverse?.((object) => {
     if (!object?.isMesh || !object.geometry) {
       return;
     }
+    const occurrenceId = cadOccurrenceIdForObject(object) || String(object?.name || `glb:${accumulator.parts.length}`).trim();
+    const primitiveIndexBase = nextPrimitiveIndexByOccurrence.get(occurrenceId) || 0;
     const groups = Array.isArray(object.geometry.groups) && object.geometry.groups.length
       ? object.geometry.groups
       : [null];
-    for (const group of groups) {
+    groups.forEach((group, primitiveIndex) => {
       appendGlbPrimitive(
         THREE,
         accumulator,
@@ -193,9 +211,11 @@ function buildMeshDataFromGltf(THREE, gltf) {
         group,
         materialForGroup(object.material, group),
         declaredMaterials,
-        rootCorrection
+        rootCorrection,
+        primitiveIndexBase + primitiveIndex
       );
-    }
+    });
+    nextPrimitiveIndexByOccurrence.set(occurrenceId, primitiveIndexBase + groups.length);
   });
   const vertices = new Float32Array(accumulator.vertices);
   const colors = declaredMaterials && accumulator.colors.length === accumulator.vertices.length

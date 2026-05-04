@@ -46,9 +46,12 @@ export function useExplorerRuntime({
   KEYBOARD_ORBIT_NUDGE_RAD,
   defaultGridRadius,
   sceneScaleMode,
-  floorMode
+  floorMode,
+  onContextLost,
+  onContextRestored,
+  runtimeResetToken = 0
 }) {
-  // Runtime setup/teardown should run once on mount, matching the previous CadExplorer behavior.
+  // Runtime setup/teardown should run once per WebGL runtime epoch.
   useEffect(() => {
     let cancelled = false;
     let cleanup = () => {};
@@ -91,7 +94,8 @@ export function useExplorerRuntime({
       const scene = new THREE.Scene();
 
       const camera = new THREE.PerspectiveCamera(48, width / height, 0.1, 50000);
-      camera.position.set(180, 120, 180);
+      camera.up.set(0, 0, 1);
+      camera.position.set(180, -180, 120);
 
       const renderer = new THREE.WebGLRenderer({
         antialias: true,
@@ -132,7 +136,7 @@ export function useExplorerRuntime({
         getExplorerThemeValue(explorerTheme, "keyLightColor", DEFAULT_LIGHTING.keyLightColor),
         getExplorerThemeValue(explorerTheme, "keyLightIntensity", DEFAULT_LIGHTING.keyLightIntensity)
       );
-      keyLight.position.set(240, 340, 150);
+      keyLight.position.set(240, -150, 340);
       keyLight.castShadow = true;
       keyLight.shadow.mapSize.set(2048, 2048);
       keyLight.shadow.bias = -0.00025;
@@ -142,16 +146,16 @@ export function useExplorerRuntime({
         getExplorerThemeValue(explorerTheme, "fillLightColor", DEFAULT_LIGHTING.fillLightColor),
         getExplorerThemeValue(explorerTheme, "fillLightIntensity", DEFAULT_LIGHTING.fillLightIntensity)
       );
-      fillLight.position.set(120, 80, -210);
+      fillLight.position.set(120, 80, 210);
       scene.add(fillLight);
       const rimLight = new THREE.DirectionalLight(
         getExplorerThemeValue(explorerTheme, "rimLightColor", DEFAULT_LIGHTING.rimLightColor),
         getExplorerThemeValue(explorerTheme, "rimLightIntensity", DEFAULT_LIGHTING.rimLightIntensity)
       );
-      rimLight.position.set(-260, 180, 240);
+      rimLight.position.set(-260, 240, 180);
       scene.add(rimLight);
       const spotLight = new THREE.SpotLight("#ffffff", 0, 0, Math.PI / 6);
-      spotLight.position.set(160, 120, 100);
+      spotLight.position.set(160, -120, 140);
       spotLight.visible = false;
       spotLight.castShadow = false;
       spotLight.shadow.mapSize.set(1024, 1024);
@@ -221,6 +225,16 @@ export function useExplorerRuntime({
           return;
         }
         screenSpaceLineMaterials.delete(material);
+      };
+      const handleContextLost = (event) => {
+        event.preventDefault();
+        clearKeyboardOrbitState(keyboardOrbitState);
+        setError("WebGL context was lost. Restoring CAD Explorer...");
+        onContextLost?.();
+      };
+      const handleContextRestored = () => {
+        setError("");
+        onContextRestored?.();
       };
 
       const applyRenderQuality = (pixelRatioCap) => {
@@ -350,6 +364,8 @@ export function useExplorerRuntime({
       controls.addEventListener("change", handleControlsChange);
       controls.addEventListener("end", handleControlsEnd);
       renderer.domElement.addEventListener("wheel", handleWheel, wheelListenerOptions);
+      renderer.domElement.addEventListener("webglcontextlost", handleContextLost, false);
+      renderer.domElement.addEventListener("webglcontextrestored", handleContextRestored, false);
 
       const handleKeyDown = (event) => {
         if (
@@ -505,6 +521,8 @@ export function useExplorerRuntime({
         runtime.controls.removeEventListener("change", handleControlsChange);
         runtime.controls.removeEventListener("end", handleControlsEnd);
         runtime.renderer.domElement.removeEventListener("wheel", handleWheel, wheelListenerOptions);
+        runtime.renderer.domElement.removeEventListener("webglcontextlost", handleContextLost, false);
+        runtime.renderer.domElement.removeEventListener("webglcontextrestored", handleContextRestored, false);
         window.removeEventListener("keydown", handleKeyDown);
         window.removeEventListener("keyup", handleKeyUp);
         window.removeEventListener("blur", clearKeyboardOrbit);
@@ -539,5 +557,5 @@ export function useExplorerRuntime({
       cleanup();
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
+  }, [runtimeResetToken]);
 }

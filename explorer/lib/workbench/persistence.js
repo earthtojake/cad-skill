@@ -18,7 +18,6 @@ export const LOOK_SETTINGS_STORAGE_KEY = "cad-explorer:look-settings";
 const CAD_WORKSPACE_GLASS_TONE_STORAGE_KEY = "cad-explorer:workbench-glass-tone:v1";
 const DXF_BEND_OVERRIDE_STORAGE_KEY = "cad-explorer:dxf-bend-overrides:v1";
 const CAD_WORKSPACE_SESSION_STORAGE_VERSION = 2;
-const CAD_WORKSPACE_LOCAL_STORAGE_VERSION = 1;
 const CAD_WORKSPACE_LEGACY_DEFAULT_PANEL_WIDTH = 300;
 
 export const CAD_WORKSPACE_DEFAULT_SIDEBAR_WIDTH = 260;
@@ -371,32 +370,17 @@ const GLOBAL_STATE_SCHEMA = [
     equals: stringListEqual
   },
   {
-    key: "desktopSidebarOpen",
+    key: "sidebarOpen",
     defaultValue: true,
     normalize: (value) => normalizeBoolean(value, true)
   },
   {
-    key: "mobileSidebarOpen",
+    key: "fileSheetOpen",
     defaultValue: false,
     normalize: (value) => normalizeBoolean(value, false)
   },
   {
-    key: "desktopFileSheetOpen",
-    defaultValue: true,
-    normalize: (value) => normalizeBoolean(value, true)
-  },
-  {
-    key: "mobileFileSheetOpen",
-    defaultValue: false,
-    normalize: (value) => normalizeBoolean(value, false)
-  },
-  {
-    key: "desktopLookSheetOpen",
-    defaultValue: false,
-    normalize: (value) => normalizeBoolean(value, false)
-  },
-  {
-    key: "mobileLookSheetOpen",
+    key: "lookSheetOpen",
     defaultValue: false,
     normalize: (value) => normalizeBoolean(value, false)
   },
@@ -527,45 +511,34 @@ function buildOpenTabs(tabsState) {
 
 function migrateGlobalStateSource(source = {}) {
   const normalizedSource = source && typeof source === "object" ? { ...source } : {};
-  if (!hasOwn(normalizedSource, "desktopSidebarOpen") && hasOwn(normalizedSource, "sidebarOpen")) {
-    normalizedSource.desktopSidebarOpen = normalizedSource.sidebarOpen;
+  if (!hasOwn(normalizedSource, "sidebarOpen")) {
+    if (hasOwn(normalizedSource, "desktopSidebarOpen")) {
+      normalizedSource.sidebarOpen = normalizedSource.desktopSidebarOpen;
+    } else if (hasOwn(normalizedSource, "mobileSidebarOpen")) {
+      normalizedSource.sidebarOpen = normalizedSource.mobileSidebarOpen;
+    }
   }
-  if (!hasOwn(normalizedSource, "desktopFileSheetOpen") && hasOwn(normalizedSource, "fileSheetOpen")) {
-    normalizedSource.desktopFileSheetOpen = normalizedSource.fileSheetOpen;
+  if (!hasOwn(normalizedSource, "fileSheetOpen")) {
+    if (hasOwn(normalizedSource, "desktopFileSheetOpen")) {
+      normalizedSource.fileSheetOpen = normalizedSource.desktopFileSheetOpen;
+    } else if (hasOwn(normalizedSource, "mobileFileSheetOpen")) {
+      normalizedSource.fileSheetOpen = normalizedSource.mobileFileSheetOpen;
+    } else if (hasOwn(normalizedSource, "tabToolsOpen")) {
+      normalizedSource.fileSheetOpen = normalizedSource.tabToolsOpen;
+    }
   }
-  if (!hasOwn(normalizedSource, "desktopFileSheetOpen") && hasOwn(normalizedSource, "tabToolsOpen")) {
-    normalizedSource.desktopFileSheetOpen = normalizedSource.tabToolsOpen;
-  }
-  if (!hasOwn(normalizedSource, "desktopLookSheetOpen") && hasOwn(normalizedSource, "lookSheetOpen")) {
-    normalizedSource.desktopLookSheetOpen = normalizedSource.lookSheetOpen;
+  if (!hasOwn(normalizedSource, "lookSheetOpen")) {
+    if (hasOwn(normalizedSource, "desktopLookSheetOpen")) {
+      normalizedSource.lookSheetOpen = normalizedSource.desktopLookSheetOpen;
+    } else if (hasOwn(normalizedSource, "mobileLookSheetOpen")) {
+      normalizedSource.lookSheetOpen = normalizedSource.mobileLookSheetOpen;
+    }
   }
   return normalizedSource;
 }
 
-function normalizeGlobalState(source = {}, localSource = null) {
-  const localNormalized = localSource && typeof localSource === "object"
-    ? normalizeSchemaState(GLOBAL_STATE_SCHEMA, migrateGlobalStateSource(localSource))
-    : null;
-  if (!localNormalized) {
-    return normalizeSchemaState(GLOBAL_STATE_SCHEMA, migrateGlobalStateSource(source));
-  }
-  return normalizeSchemaState(GLOBAL_STATE_SCHEMA, {
-    ...migrateGlobalStateSource(source),
-    ...localNormalized
-  });
-}
-
-function parseLocalGlobalState(rawValue) {
-  if (!rawValue || typeof rawValue !== "object") {
-    return null;
-  }
-  if (Number(rawValue.version) !== CAD_WORKSPACE_LOCAL_STORAGE_VERSION) {
-    return null;
-  }
-  if (!rawValue.global || typeof rawValue.global !== "object") {
-    return null;
-  }
-  return normalizeSchemaState(GLOBAL_STATE_SCHEMA, rawValue.global);
+function normalizeGlobalState(source = {}) {
+  return normalizeSchemaState(GLOBAL_STATE_SCHEMA, migrateGlobalStateSource(source));
 }
 
 function readStorageJson(storage, key) {
@@ -803,14 +776,14 @@ export function createTabRecord(key, overrides = {}) {
   };
 }
 
-export function buildCadWorkspaceSessionState(source = {}, { validEntryKeys, localGlobalState } = {}) {
+export function buildCadWorkspaceSessionState(source = {}, { validEntryKeys } = {}) {
   const globalSource = (source?.globalState && typeof source.globalState === "object")
     ? source.globalState
     : (source?.global && typeof source.global === "object")
       ? source.global
       : source;
 
-  const globalState = normalizeGlobalState(globalSource, localGlobalState);
+  const globalState = normalizeGlobalState(globalSource);
   const tabsState = normalizeTabsState(source, validEntryKeys);
   const openTabs = buildOpenTabs(tabsState);
 
@@ -822,13 +795,9 @@ export function buildCadWorkspaceSessionState(source = {}, { validEntryKeys, loc
     selectedKey: tabsState.selectedKey,
     query: globalState.query,
     expandedDirectoryIds: globalState.expandedDirectoryIds,
-    desktopSidebarOpen: globalState.desktopSidebarOpen,
-    mobileSidebarOpen: globalState.mobileSidebarOpen,
-    desktopFileSheetOpen: globalState.desktopFileSheetOpen,
-    mobileFileSheetOpen: globalState.mobileFileSheetOpen,
-    desktopLookSheetOpen: globalState.desktopLookSheetOpen,
-    mobileLookSheetOpen: globalState.mobileLookSheetOpen,
-    sidebarOpen: globalState.desktopSidebarOpen,
+    sidebarOpen: globalState.sidebarOpen,
+    fileSheetOpen: globalState.fileSheetOpen,
+    lookSheetOpen: globalState.lookSheetOpen,
     sidebarWidth: globalState.sidebarWidth,
     tabToolsWidth: globalState.tabToolsWidth,
     urdfEntryAnimationEnabled: globalState.urdfEntryAnimationEnabled
@@ -849,7 +818,7 @@ function serializeCadWorkspaceSessionState(snapshot) {
   };
 }
 
-function parseCadWorkspaceSessionState(rawValue, validEntryKeys, localGlobalState) {
+function parseCadWorkspaceSessionState(rawValue, validEntryKeys) {
   if (!rawValue || typeof rawValue !== "object") {
     return null;
   }
@@ -866,10 +835,7 @@ function parseCadWorkspaceSessionState(rawValue, validEntryKeys, localGlobalStat
   return buildCadWorkspaceSessionState({
     global: rawValue.global,
     tabs: rawValue.tabs
-  }, {
-    validEntryKeys,
-    localGlobalState
-  });
+  }, { validEntryKeys });
 }
 
 export function readCadWorkspaceSessionState(validEntryKeys) {
@@ -877,28 +843,12 @@ export function readCadWorkspaceSessionState(validEntryKeys) {
     return null;
   }
 
-  const localGlobalState = parseLocalGlobalState(
-    readStorageJson(window.localStorage, CAD_WORKSPACE_LOCAL_STORAGE_KEY)
-  );
-
   const v2Session = parseCadWorkspaceSessionState(
     readStorageJson(window.sessionStorage, CAD_WORKSPACE_SESSION_STORAGE_KEY),
-    validEntryKeys,
-    localGlobalState
+    validEntryKeys
   );
   if (v2Session) {
     return v2Session;
-  }
-
-  if (localGlobalState) {
-    return buildCadWorkspaceSessionState(
-      {
-        globalState: localGlobalState,
-        openTabs: [],
-        selectedKey: ""
-      },
-      { validEntryKeys }
-    );
   }
 
   return null;
@@ -916,16 +866,7 @@ export function writeCadWorkspaceSessionState(source, options = {}) {
     serializeCadWorkspaceSessionState(snapshot),
     options
   );
-  const globalWritten = writeStorageJson(
-    window.localStorage,
-    CAD_WORKSPACE_LOCAL_STORAGE_KEY,
-    {
-      version: CAD_WORKSPACE_LOCAL_STORAGE_VERSION,
-      global: cloneSchemaState(GLOBAL_STATE_SCHEMA, snapshot.globalState)
-    },
-    options
-  );
-  return sessionWritten && globalWritten;
+  return sessionWritten;
 }
 
 export function resetCadWorkspacePersistence({ onWriteError } = {}) {

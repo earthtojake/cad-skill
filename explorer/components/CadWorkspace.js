@@ -62,6 +62,10 @@ import {
   writeCadWorkspaceSessionState
 } from "../lib/workbench/persistence";
 import {
+  CAD_WORKSPACE_LAYOUT_MODE,
+  getCadWorkspaceLayoutMode
+} from "../lib/workbench/breakpoints";
+import {
   buildSidebarDirectoryTree,
   cadPathForEntry,
   collectAncestorDirectoryIds,
@@ -122,9 +126,8 @@ import { copyTextToClipboard } from "../lib/clipboard";
 const DEFAULT_DOCUMENT_TITLE = "CAD Explorer";
 const EMPTY_LIST = Object.freeze([]);
 const CAD_BUILD_COMMANDS = {
-  dxf: "python .agents/skills/cad/scripts/gen_dxf/cli.py",
-  stepAssembly: "python .agents/skills/cad/scripts/gen_step_assembly/cli.py",
-  stepPart: "python .agents/skills/cad/scripts/gen_step_part/cli.py",
+  dxf: "python .agents/skills/cad/scripts/dxf",
+  step: "python scripts/step",
   urdf: "python .agents/skills/urdf/scripts/gen_urdf/cli.py"
 };
 const DEFAULT_URDF_ANIMATION_SETTINGS = Object.freeze({
@@ -441,7 +444,9 @@ function buildMeshCacheKey(entry) {
 
 function buildReferenceCacheKey(entry) {
   const fileRef = fileKey(entry);
-  const referenceHash = entryAssetHash(entry, "topology") || String(entry?.step?.hash || "");
+  const referenceHash = [
+    entryAssetHash(entry, "selectorTopology"),
+  ].filter(Boolean).join(":") || String(entry?.step?.hash || "");
   return fileRef && referenceHash ? `${fileRef}:${referenceHash}` : "";
 }
 
@@ -469,6 +474,10 @@ function entryAssetHash(entry, key) {
   return String(entryAsset(entry, key)?.hash || "").trim();
 }
 
+function entrySelectorTopologyAssetUrl(entry) {
+  return entryAssetUrl(entry, "selectorTopology") || entryAssetUrl(entry, "topology") || entryAssetUrl(entry, "glb");
+}
+
 function entryUrdfAssetHash(entry) {
   return [
     entryAssetHash(entry, "urdf"),
@@ -491,15 +500,13 @@ function buildCadCommand(fileRef, entry = null) {
   if (sourceFormat === RENDER_FORMAT.THREE_MF) {
     return "";
   }
-  const command = entry?.kind === "assembly" ? CAD_BUILD_COMMANDS.stepAssembly : CAD_BUILD_COMMANDS.stepPart;
-  return `${command} ${fileRef}`;
+  return `${CAD_BUILD_COMMANDS.step} ${fileRef}`;
 }
 
 function entryHasMesh(entry) {
-  if (entry?.kind === "assembly") {
+  if (entrySourceFormat(entry) === RENDER_FORMAT.STEP) {
     return Boolean(
-      entryAssetUrl(entry, "topology") &&
-      entryAssetHash(entry, "topology") &&
+      entry?.stepArtifact?.ok &&
       entryAssetUrl(entry, "glb") &&
       entryAssetHash(entry, "glb")
     );
@@ -514,10 +521,10 @@ function entryHasUrdf(entry) {
 
 function entryHasReferences(entry) {
   return Boolean(
-    entryAssetUrl(entry, "topology") &&
-    entryAssetUrl(entry, "topologyBinary") &&
-    entryAssetHash(entry, "topology") &&
-    entryAssetHash(entry, "topologyBinary")
+    entrySourceFormat(entry) === RENDER_FORMAT.STEP &&
+    entry?.stepArtifact?.ok &&
+    entryAssetUrl(entry, "glb") &&
+    entryAssetHash(entry, "selectorTopology")
   );
 }
 
@@ -581,8 +588,7 @@ function normalizeReferenceList(value) {
 function readReferenceCounts(referencePayload = null) {
   return {
     faces: Math.max(0, Number(referencePayload?.manifest?.stats?.faceCount || 0)),
-    edges: Math.max(0, Number(referencePayload?.manifest?.stats?.edgeCount || 0)),
-    vertices: Math.max(0, Number(referencePayload?.manifest?.stats?.vertexCount || 0))
+    edges: Math.max(0, Number(referencePayload?.manifest?.stats?.edgeCount || 0))
   };
 }
 
@@ -590,7 +596,8 @@ function buildNormalizedReferenceState(entry, referencePayload = null, {
   copyCadPath,
   partId = "",
   transform = null,
-  remapOccurrenceId = ""
+  remapOccurrenceId = "",
+  remapOccurrencePrefix = null
 } = {}) {
   const counts = readReferenceCounts(referencePayload);
 
@@ -598,7 +605,8 @@ function buildNormalizedReferenceState(entry, referencePayload = null, {
     copyCadPath: copyCadPath || cadPathForEntry(entry),
     partId,
     transform,
-    remapOccurrenceId
+    remapOccurrenceId,
+    remapOccurrencePrefix
   });
   const references = normalizeReferenceList(selectorRuntime.references);
   return {
@@ -609,8 +617,7 @@ function buildNormalizedReferenceState(entry, referencePayload = null, {
     stepHash: String(selectorRuntime.stepHash || entry?.step?.hash || ""),
     counts: {
       faces: Number(selectorRuntime.faces?.length || 0),
-      edges: Number(selectorRuntime.edges?.length || 0),
-      vertices: Number(selectorRuntime.vertices?.length || 0)
+      edges: Number(selectorRuntime.edges?.length || 0)
     },
     parts: [],
     selectorRuntime,
@@ -1068,6 +1075,26 @@ function buildExplorerMeshAlert(entry, hasMeshData, loadError) {
 
   const sourceFormat = entrySourceFormat(entry);
   const command = buildCadCommand(fileRef, entry);
+  const stepArtifactError = sourceFormat === RENDER_FORMAT.STEP && !entry?.stepArtifact?.ok
+    ? entry?.stepArtifact?.error
+    : null;
+  if (stepArtifactError) {
+    const code = String(stepArtifactError.code || "").trim();
+    const summary = code === "missing_glb"
+      ? "STEP artifacts missing"
+      : code === "stale_step_topology"
+        ? "STEP artifacts stale"
+        : "STEP artifacts invalid";
+    const regenerateCommand = String(stepArtifactError.regenerateCommand || CAD_BUILD_COMMANDS.step).trim();
+    return {
+      severity: "error",
+      compact: true,
+      summary,
+      title: summary,
+      message: String(stepArtifactError.message || "STEP artifacts are unavailable."),
+      command: regenerateCommand ? `${regenerateCommand} ${fileRef}` : command
+    };
+  }
   const meshSidecarFormat = sourceFormat === RENDER_FORMAT.STL || sourceFormat === RENDER_FORMAT.THREE_MF;
   const meshSidecarLabel = sourceFormat === RENDER_FORMAT.THREE_MF ? "3MF" : "STL";
   const reloadResolution = meshSidecarFormat
@@ -1177,15 +1204,13 @@ export default function CadWorkspace({
   const [persistenceStatus, setPersistenceStatus] = useState("");
   const [motionErrorStatus, setMotionErrorStatus] = useState("");
   const [robotMotionServerLive, setRobotMotionServerLive] = useState(false);
-  const [sidebarOpen, setSidebarOpen] = useState(true);
-  const [mobileSidebarOpen, setMobileSidebarOpen] = useState(false);
+  const [workspaceLayoutMode, setWorkspaceLayoutMode] = useState(() => getCadWorkspaceLayoutMode(readWorkspaceViewportWidth()));
+  const [sidebarOpen, setSidebarOpen] = useState(() => getCadWorkspaceLayoutMode(readWorkspaceViewportWidth()) === CAD_WORKSPACE_LAYOUT_MODE.WIDE);
   const [sidebarWidth, setSidebarWidth] = useState(DEFAULT_SIDEBAR_WIDTH);
   const [layoutViewportWidth, setLayoutViewportWidth] = useState(readWorkspaceViewportWidth);
-  const [isDesktop, setIsDesktop] = useState(false);
-  const [desktopFileSheetOpen, setDesktopFileSheetOpen] = useState(true);
-  const [mobileFileSheetOpen, setMobileFileSheetOpen] = useState(false);
-  const [desktopLookMenuOpen, setDesktopLookMenuOpen] = useState(false);
-  const [mobileLookMenuOpen, setMobileLookMenuOpen] = useState(false);
+  const isDesktop = workspaceLayoutMode === CAD_WORKSPACE_LAYOUT_MODE.WIDE;
+  const [fileSheetOpenIntent, setFileSheetOpenIntent] = useState(false);
+  const [lookMenuOpenIntent, setLookMenuOpenIntent] = useState(false);
   const [explorerAlertOpen, setExplorerAlertOpen] = useState(false);
   const [explorerRuntimeAlert, setExplorerRuntimeAlert] = useState(null);
   const [lookSettings, setLookSettings] = useState(readLookSettings);
@@ -1719,8 +1744,13 @@ export default function CadWorkspace({
     !!selectedEntry &&
     urdfStatus !== ASSET_STATUS.ERROR &&
     (!selectedUrdfMatches || urdfStatus === ASSET_STATUS.LOADING);
+  const stepArtifactInvalid =
+    effectiveRenderFormat === RENDER_FORMAT.STEP &&
+    selectedEntry?.stepArtifact &&
+    !selectedEntry.stepArtifact.ok;
   const stepExplorerLoading =
     !!selectedEntry &&
+    !stepArtifactInvalid &&
     status !== ASSET_STATUS.ERROR &&
     (!selectedMeshMatches || status === ASSET_STATUS.LOADING);
   const explorerLoading = effectiveRenderFormat === RENDER_FORMAT.DXF
@@ -1878,22 +1908,20 @@ export default function CadWorkspace({
     openTabsRef.current = openTabs;
   }, [openTabs]);
 
-  const tabToolsOpen = isDesktop ? desktopFileSheetOpen : mobileFileSheetOpen;
-  const lookMenuOpen = isDesktop ? desktopLookMenuOpen : mobileLookMenuOpen;
+  const tabToolsOpen = fileSheetOpenIntent;
+  const lookMenuOpen = lookMenuOpenIntent;
 
   const setTabToolsOpen = useCallback((value) => {
-    const setFileSheetOpen = isDesktop ? setDesktopFileSheetOpen : setMobileFileSheetOpen;
-    setFileSheetOpen((current) => (
+    setFileSheetOpenIntent((current) => (
       typeof value === "function" ? value(current) : value
     ));
-  }, [isDesktop]);
+  }, []);
 
   const setLookMenuOpen = useCallback((value) => {
-    const setLookSheetOpen = isDesktop ? setDesktopLookMenuOpen : setMobileLookMenuOpen;
-    setLookSheetOpen((current) => (
+    setLookMenuOpenIntent((current) => (
       typeof value === "function" ? value(current) : value
     ));
-  }, [isDesktop]);
+  }, []);
 
   const updateLookSettings = useCallback((updater) => {
     setLookSettings((current) => {
@@ -1966,11 +1994,6 @@ export default function CadWorkspace({
       return nextOpen;
     });
   }, []);
-
-  const setActiveSidebarOpen = useCallback((value) => {
-    const setOpen = isDesktop ? handleSidebarOpenChange : setMobileSidebarOpen;
-    setOpen(value);
-  }, [handleSidebarOpenChange, isDesktop]);
 
   const handleStartFileSheetResize = useCallback((event) => {
     if (event.button !== 0) {
@@ -2087,12 +2110,9 @@ export default function CadWorkspace({
       selectedKey,
       query,
       expandedDirectoryIds: Array.from(expandedDirectoryIds),
-      desktopSidebarOpen: sidebarOpen,
-      mobileSidebarOpen,
-      desktopFileSheetOpen,
-      mobileFileSheetOpen,
-      desktopLookSheetOpen: desktopLookMenuOpen,
-      mobileLookSheetOpen: mobileLookMenuOpen,
+      sidebarOpen,
+      fileSheetOpen: fileSheetOpenIntent,
+      lookSheetOpen: lookMenuOpenIntent,
       sidebarWidth,
       tabToolsWidth,
       urdfEntryAnimationEnabled
@@ -2100,11 +2120,8 @@ export default function CadWorkspace({
   }, [
     buildActiveTabSnapshot,
     expandedDirectoryIds,
-    desktopFileSheetOpen,
-    desktopLookMenuOpen,
-    mobileFileSheetOpen,
-    mobileLookMenuOpen,
-    mobileSidebarOpen,
+    fileSheetOpenIntent,
+    lookMenuOpenIntent,
     openTabs,
     query,
     selectedKey,
@@ -2327,11 +2344,8 @@ export default function CadWorkspace({
     setQuery,
     setExpandedDirectoryIds,
     setSidebarOpen,
-    setMobileSidebarOpen,
-    setDesktopFileSheetOpen,
-    setMobileFileSheetOpen,
-    setDesktopLookMenuOpen,
-    setMobileLookMenuOpen,
+    setFileSheetOpen: setFileSheetOpenIntent,
+    setLookMenuOpen: setLookMenuOpenIntent,
     setSidebarWidth,
     setTabToolsWidth,
     setUrdfEntryAnimationEnabled,
@@ -2408,8 +2422,11 @@ export default function CadWorkspace({
   useEffect(() => {
     if (lookMenuOpen) {
       setTabToolsOpen(false);
+      if (!isDesktop) {
+        setSidebarOpen(false);
+      }
     }
-  }, [lookMenuOpen, setTabToolsOpen]);
+  }, [isDesktop, lookMenuOpen, setTabToolsOpen]);
 
   useEffect(() => {
     selectedReferenceIdsRef.current = selectedReferenceIds;
@@ -2525,7 +2542,7 @@ export default function CadWorkspace({
 
   useCadWorkspaceLayout({
     isDesktop,
-    setIsDesktop,
+    setLayoutMode: setWorkspaceLayoutMode,
     setSidebarOpen,
     setTabToolsOpen,
     setLayoutViewportWidth,
@@ -2831,10 +2848,7 @@ export default function CadWorkspace({
 
     if (!inspectedAssemblyPartEntry && String(inspectedAssemblyPart?.sourceKind || "") === "native" && entryHasReferences(selectedEntry)) {
       const occurrenceId = String(inspectedAssemblyPart?.occurrenceId || inspectedAssemblyPart?.id || "").trim();
-      const cachedBundle = loadRenderSelectorBundle(
-        entryAssetUrl(selectedEntry, "topology"),
-        entryAssetUrl(selectedEntry, "topologyBinary")
-      );
+      const cachedBundle = loadRenderSelectorBundle(entrySelectorTopologyAssetUrl(selectedEntry));
       setInspectedAssemblyReferenceStatus(REFERENCE_STATUS.LOADING);
       setInspectedAssemblyReferenceError("");
       cachedBundle.then((bundle) => {
@@ -2888,10 +2902,22 @@ export default function CadWorkspace({
     const transform = Array.isArray(inspectedAssemblyPart?.transform) && inspectedAssemblyPart.transform.length === 16
       ? inspectedAssemblyPart.transform.map((value) => Number(value))
       : null;
-    const cachedBundle = loadRenderSelectorBundle(
-      entryAssetUrl(inspectedAssemblyPartEntry, "topology"),
-      entryAssetUrl(inspectedAssemblyPartEntry, "topologyBinary")
-    );
+    const sourceRootOccurrenceId = String(inspectedAssemblyPart?.sourceRootOccurrenceId || "").trim();
+    const targetRootOccurrenceId = String(
+      inspectedAssemblyPart?.sourceRootTargetOccurrenceId ||
+      inspectedAssemblyPart?.occurrenceId ||
+      inspectedAssemblyPart?.id ||
+      ""
+    ).trim();
+    const sourceOccurrenceId = String(inspectedAssemblyPart?.sourceOccurrenceId || "").trim();
+    const remapOccurrencePrefix = sourceRootOccurrenceId && targetRootOccurrenceId
+      ? {
+        sourceRootOccurrenceId,
+        targetRootOccurrenceId,
+        sourceOccurrenceId
+      }
+      : null;
+    const cachedBundle = loadRenderSelectorBundle(entrySelectorTopologyAssetUrl(inspectedAssemblyPartEntry));
 
     setInspectedAssemblyReferenceStatus(REFERENCE_STATUS.LOADING);
     setInspectedAssemblyReferenceError("");
@@ -2904,7 +2930,10 @@ export default function CadWorkspace({
         copyCadPath: cadPathForEntry(selectedEntry) || cadPathForEntry(inspectedAssemblyPartEntry),
         partId: inspectedAssemblyPart.id,
         transform,
-        remapOccurrenceId: String(inspectedAssemblyPart?.occurrenceId || inspectedAssemblyPart?.id || "").trim()
+        remapOccurrenceId: remapOccurrencePrefix
+          ? ""
+          : String(inspectedAssemblyPart?.occurrenceId || inspectedAssemblyPart?.id || "").trim(),
+        remapOccurrencePrefix
       });
       setInspectedAssemblyReferenceState(nextReferenceState);
       setInspectedAssemblyReferenceStatus(
@@ -2938,9 +2967,6 @@ export default function CadWorkspace({
   const isEdgeReference = useCallback((reference) => (
     String(reference?.selectorType || "").trim() === "edge"
   ), []);
-  const isCornerReference = useCallback((reference) => (
-    String(reference?.selectorType || "").trim() === "vertex"
-  ), []);
   const referencePartId = useCallback((reference) => {
     const explicitPartId = String(reference?.partId || "").trim();
     if (explicitPartId) {
@@ -2959,7 +2985,7 @@ export default function CadWorkspace({
         if (!partId || partId !== inspectedAssemblyPartId) {
           return false;
         }
-        return isFaceReference(reference) || isEdgeReference(reference) || isCornerReference(reference);
+        return isFaceReference(reference) || isEdgeReference(reference);
       });
     if (topologyReferences.length) {
       return topologyReferences;
@@ -2968,7 +2994,6 @@ export default function CadWorkspace({
   }, [
     inspectedAssemblyPartId,
     inspectedAssemblyPartReferences,
-    isCornerReference,
     isAssemblyView,
     isEdgeReference,
     isFaceReference,
@@ -3014,10 +3039,7 @@ export default function CadWorkspace({
     () => explorerPickableReferences.filter((reference) => isEdgeReference(reference)),
     [isEdgeReference, explorerPickableReferences]
   );
-  const explorerPickableVertices = useMemo(
-    () => explorerPickableReferences.filter((reference) => isCornerReference(reference)),
-    [isCornerReference, explorerPickableReferences]
-  );
+  const explorerPickableVertices = EMPTY_LIST;
   const referenceSelectionStatus = isAssemblyView && isInspectingAssemblyPart
     ? inspectedAssemblyReferenceStatus
     : referenceStatus;
@@ -3173,6 +3195,16 @@ export default function CadWorkspace({
     hoveredPartId,
     isAssemblyView,
     isInspectingAssemblyPart,
+    renderPartIdsForAssemblySelection
+  ]);
+  const explorerFocusedPartIds = useMemo(() => {
+    if (!isAssemblyView || !inspectedAssemblyPartId) {
+      return [];
+    }
+    return renderPartIdsForAssemblySelection(inspectedAssemblyPartId);
+  }, [
+    inspectedAssemblyPartId,
+    isAssemblyView,
     renderPartIdsForAssemblySelection
   ]);
 
@@ -3872,7 +3904,7 @@ export default function CadWorkspace({
     }
     const next = computeNextSelectionIds(selectedReferenceIdsRef.current, referenceId, { multiSelect });
     if (next.length && !isDesktop) {
-      setMobileSidebarOpen(false);
+      setSidebarOpen(false);
     }
     setSelectedWholeEntryCadRefToken("");
     selectedReferenceIdsRef.current = next;
@@ -3988,6 +4020,9 @@ export default function CadWorkspace({
     resetReferenceInteractionState();
     setExpandedAssemblyPartIds([]);
   }, [resetReferenceInteractionState]);
+  const handleExitActiveAssemblyInspection = assemblyBreadcrumbNodes.length > 1
+    ? handleBackAssemblyInspection
+    : handleExitAssemblyPartInspection;
 
   const togglePartSelection = useCallback((partId, { multiSelect = false, renderPartId = "" } = {}) => {
     if (stepUpdateInProgress) {
@@ -3996,7 +4031,7 @@ export default function CadWorkspace({
     const normalizedPartId = String(partId || "").trim();
     const next = computeNextSelectionIds(selectedPartIdsRef.current, partId, { multiSelect });
     if (next.length && !isDesktop) {
-      setMobileSidebarOpen(false);
+      setSidebarOpen(false);
     }
     setSelectedWholeEntryCadRefToken("");
     selectedPartIdsRef.current = next;
@@ -4155,7 +4190,7 @@ export default function CadWorkspace({
   const handleSelectEntry = useCallback((key) => {
     activateEntryTab(key);
     if (!isDesktop) {
-      setMobileSidebarOpen(false);
+      setSidebarOpen(false);
     }
   }, [activateEntryTab, isDesktop]);
 
@@ -4174,8 +4209,14 @@ export default function CadWorkspace({
     }
     setLookMenuOpen(false);
     setExplorerAlertOpen(false);
-    setTabToolsOpen((current) => !current);
-  }, [selectedFileSheetKind, setLookMenuOpen, setTabToolsOpen]);
+    setTabToolsOpen((current) => {
+      const nextOpen = !current;
+      if (nextOpen && !isDesktop) {
+        setSidebarOpen(false);
+      }
+      return nextOpen;
+    });
+  }, [isDesktop, selectedFileSheetKind, setLookMenuOpen, setTabToolsOpen]);
 
   const handleDrawingStrokesChange = useCallback((nextStrokes) => {
     const normalized = cloneDrawingStrokes(nextStrokes);
@@ -4267,7 +4308,7 @@ export default function CadWorkspace({
     lookSheetOpen: lookMenuOpen && !previewMode,
     tabToolsOpen,
     isDesktop,
-    sidebarOpen: isDesktop ? sidebarOpen : mobileSidebarOpen,
+    sidebarOpen,
     previewUiStateRef,
     tabToolMode,
     drawingUndoStackRef,
@@ -4278,7 +4319,7 @@ export default function CadWorkspace({
     setExplorerAlertOpen,
     setLookMenuOpen,
     setTabToolsOpen,
-    setSidebarOpen: setActiveSidebarOpen,
+    setSidebarOpen,
     setTabToolMode
   });
 
@@ -4325,7 +4366,7 @@ export default function CadWorkspace({
       return;
     }
     previewUiStateRef.current = {
-      sidebarOpen: isDesktop ? sidebarOpen : mobileSidebarOpen,
+      sidebarOpen,
       tabToolsOpen,
       tabToolMode,
       lookMenuOpen,
@@ -4338,16 +4379,13 @@ export default function CadWorkspace({
     setDrawingRedoStack([]);
     setExplorerAlertOpen(false);
     setLookMenuOpen(false);
-    setActiveSidebarOpen(false);
+    setSidebarOpen(false);
     setTabToolsOpen(false);
     setPreviewMode(true);
   }, [
     effectiveRenderFormat,
-    isDesktop,
     previewMode,
-    mobileSidebarOpen,
     sidebarOpen,
-    setActiveSidebarOpen,
     setLookMenuOpen,
     setTabToolsOpen,
     selectedMeshData,
@@ -4392,11 +4430,6 @@ export default function CadWorkspace({
     top: "14px",
     right: "14px"
   };
-  const mobileCadBottomBarPosition = {
-    left: "12px",
-    right: "12px",
-    bottom: "calc(env(safe-area-inset-bottom, 0px) + 0.75rem)"
-  };
   const drawingToolOptions = [
     { id: DRAWING_TOOL.FREEHAND, label: "Freehand", Icon: PenTool },
     { id: DRAWING_TOOL.LINE, label: "Line", Icon: Minus },
@@ -4412,8 +4445,8 @@ export default function CadWorkspace({
     <SidebarProvider
       open={sidebarOpen}
       onOpenChange={handleSidebarOpenChange}
-      mobileOpen={mobileSidebarOpen}
-      onMobileOpenChange={setMobileSidebarOpen}
+      mobileOpen={sidebarOpen}
+      onMobileOpenChange={handleSidebarOpenChange}
       data-glass-tone={normalizeCadWorkspaceGlassTone(cadWorkspaceGlassTone)}
       style={{ "--sidebar-width": `${clampSidebarWidth(sidebarWidth)}px` }}
       className="relative h-svh overflow-hidden bg-transparent"
@@ -4433,7 +4466,6 @@ export default function CadWorkspace({
           explorerPerspectiveRef={activePerspectiveRef}
           lookSettings={lookSettings}
           previewMode={previewMode}
-          isDesktop={isDesktop}
           viewportFrameInsets={viewportFrameInsets}
           explorerLoading={explorerLoading}
           explorerAlert={explorerAlert}
@@ -4452,7 +4484,7 @@ export default function CadWorkspace({
           pickableFaces={explorerPickableFaces}
           pickableEdges={explorerPickableEdges}
           pickableVertices={explorerPickableVertices}
-          inspectedAssemblyPartId={isInspectingAssemblyPart ? inspectedAssemblyPartId : ""}
+          focusedPartIds={explorerFocusedPartIds}
           drawToolActive={drawToolActive}
           drawingTool={drawingTool}
           drawingStrokes={drawingStrokes}
@@ -4517,11 +4549,8 @@ export default function CadWorkspace({
               <FloatingToolBar
                 previewMode={previewMode}
                 selectedEntry={selectedEntry}
-                isDesktop={isDesktop}
-                sidebarOpen={false}
                 renderFormat={effectiveRenderFormat}
                 floatingCadToolbarPosition={floatingCadToolbarPosition}
-                mobileCadBottomBarPosition={mobileCadBottomBarPosition}
                 selectionToolActive={selectionToolActive}
                 referenceSelectionPending={referenceSelectionPending}
                 referenceSelectionUnavailable={referenceSelectionUnavailable}
@@ -4550,8 +4579,9 @@ export default function CadWorkspace({
               <CadWorkspaceAssemblyInspectPill
                 previewMode={previewMode}
                 inspectedAssemblyPart={inspectedAssemblyPart}
+                canGoBack={assemblyBreadcrumbNodes.length > 1}
                 toolbarHeight={0}
-                onExit={handleExitAssemblyPartInspection}
+                onExit={handleExitActiveAssemblyInspection}
               />
 
               <ExplorerLoadingOverlay

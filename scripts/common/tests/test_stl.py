@@ -3,7 +3,7 @@ import unittest
 from pathlib import Path
 
 from common import render as cad_render
-from tests.cad_test_roots import IsolatedCadRoots
+from common.tests.cad_test_roots import IsolatedCadRoots
 
 
 class CadgenRenderTests(unittest.TestCase):
@@ -27,8 +27,6 @@ class CadgenRenderTests(unittest.TestCase):
         self.cleanup_paths.update(
             (
                 cad_render.part_glb_path(step_path),
-                cad_render.part_selector_manifest_path(step_path),
-                cad_render.part_selector_binary_path(step_path),
             )
         )
         return step_path
@@ -39,27 +37,21 @@ class CadgenRenderTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "no configured STL output"):
             cad_render.part_stl_path(step_path)
 
-    def test_explorer_paths_use_step_artifact_directory(self) -> None:
+    def test_glb_path_uses_adjacent_hidden_step_glb(self) -> None:
         step_path = self._write_step("part")
 
         glb_path = cad_render.part_glb_path(step_path)
-        selector_manifest_path = cad_render.part_selector_manifest_path(step_path)
-        selector_binary_path = cad_render.part_selector_binary_path(step_path)
 
-        self.assertEqual(self.temp_root / ".part.step" / "model.glb", glb_path)
-        self.assertEqual(self.temp_root / ".part.step" / "topology.json", selector_manifest_path)
-        self.assertEqual(self.temp_root / ".part.step" / "topology.bin", selector_binary_path)
+        self.assertEqual(self.temp_root / ".part.step.glb", glb_path)
+        self.assertEqual(self.temp_root / ".part.step" / "model.glb", cad_render.legacy_part_glb_path(step_path))
 
-    def test_render_paths_preserve_stp_extension_in_artifact_directory(self) -> None:
+    def test_glb_path_preserves_stp_extension(self) -> None:
         step_path = self._write_step("part-stp", extension=".stp")
 
         glb_path = cad_render.part_glb_path(step_path)
-        selector_manifest_path = cad_render.part_selector_manifest_path(step_path)
-        selector_binary_path = cad_render.part_selector_binary_path(step_path)
 
-        self.assertEqual(self.temp_root / ".part-stp.stp" / "model.glb", glb_path)
-        self.assertEqual(self.temp_root / ".part-stp.stp" / "topology.json", selector_manifest_path)
-        self.assertEqual(self.temp_root / ".part-stp.stp" / "topology.bin", selector_binary_path)
+        self.assertEqual(self.temp_root / ".part-stp.stp.glb", glb_path)
+        self.assertEqual(self.temp_root / ".part-stp.stp" / "model.glb", cad_render.legacy_part_glb_path(step_path))
 
 
 if __name__ == "__main__":

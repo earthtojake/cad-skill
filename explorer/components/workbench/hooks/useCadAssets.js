@@ -4,27 +4,24 @@ import {
   loadRender3Mf,
   loadRenderDxf,
   loadRenderGlb,
-  loadRenderJson,
   loadRenderSelectorBundle,
   loadRenderStl,
+  loadRenderTopologyIndex,
   loadRenderUrdf,
   peekRender3Mf,
   peekRenderDxf,
   peekRenderGlb,
-  peekRenderJson,
   peekRenderSelectorBundle,
   peekRenderStl,
+  peekRenderTopologyIndex,
   peekRenderUrdf
 } from "../../../lib/renderAssetClient";
 import {
-  assemblyCompositionMeshRequests,
   assemblyRootFromTopology,
-  buildAssemblyMeshData
+  assemblyUsesSelfContainedMesh,
+  buildSelfContainedAssemblyMeshData
 } from "../../../lib/assembly/meshData";
-import { mapWithConcurrency } from "../../../lib/async/concurrency";
 import { ASSET_STATUS, REFERENCE_STATUS } from "../../../lib/workbench/constants";
-
-const ASSEMBLY_MESH_LOAD_CONCURRENCY = 8;
 
 function abortLoad(controllerRef) {
   controllerRef.current?.abort();
@@ -72,15 +69,12 @@ function entryMeshAssetHash(entry) {
   return entryAssetHash(entry, entryMeshAssetKey(entry));
 }
 
-function resolveAssetUrl(url, baseUrl = "") {
-  const rawUrl = String(url || "").trim();
-  if (!rawUrl || rawUrl.startsWith("/") || /^[a-z][a-z0-9+.-]*:/i.test(rawUrl)) {
-    return rawUrl;
-  }
-  if (typeof window === "undefined") {
-    return rawUrl;
-  }
-  return new URL(rawUrl, new URL(baseUrl || window.location.href, window.location.href)).toString();
+function entryTopologyAssetUrl(entry) {
+  return entryAssetUrl(entry, "topology") || entryAssetUrl(entry, "glb");
+}
+
+function entrySelectorTopologyAssetUrl(entry) {
+  return entryAssetUrl(entry, "selectorTopology") || entryTopologyAssetUrl(entry);
 }
 
 function peekRenderMeshForEntry(entry) {
@@ -153,12 +147,12 @@ export function useCadAssets({
     return [entryAssetHash(entry, "topology"), entryAssetHash(entry, "glb")].filter(Boolean).join(":");
   }, []);
 
-  const buildAssemblyMeshState = useCallback((entry, topologyManifest, meshesBySourcePath) => {
+  const buildSelfContainedAssemblyMeshState = useCallback((entry, topologyManifest, meshData) => {
     return {
       file: entry.file,
       kind: entry.kind,
       meshHash: getAssemblyMeshHash(entry),
-      meshData: buildAssemblyMeshData(topologyManifest, meshesBySourcePath),
+      meshData: buildSelfContainedAssemblyMeshData(topologyManifest, meshData),
       assemblyStructureReady: true,
       assemblyInteractionReady: true,
       assemblyBackgroundError: ""
@@ -183,25 +177,20 @@ export function useCadAssets({
       return null;
     }
     if (entry?.kind === "assembly") {
-      const previewMeshData = peekRenderGlb(entryAssetUrl(entry, "glb"));
+      const glbUrl = entryAssetUrl(entry, "glb");
+      const topologyUrl = entryTopologyAssetUrl(entry);
+      const previewMeshData = peekRenderGlb(glbUrl);
       if (!previewMeshData) {
         return null;
       }
-      const topologyUrl = entryAssetUrl(entry, "topology");
-      const topologyManifest = peekRenderJson(topologyUrl);
+      const topologyManifest = peekRenderTopologyIndex(topologyUrl);
       if (!topologyManifest) {
         return buildAssemblyPreviewMeshState(entry, previewMeshData);
       }
-      const meshesBySourcePath = new Map();
-      for (const request of assemblyCompositionMeshRequests(topologyManifest)) {
-        const meshUrl = resolveAssetUrl(request.meshUrl, topologyUrl);
-        const sourceMesh = peekRenderGlb(meshUrl);
-        if (!meshUrl || !sourceMesh) {
-          return buildAssemblyPreviewMeshState(entry, previewMeshData, topologyManifest);
-        }
-        meshesBySourcePath.set(request.key, sourceMesh);
+      if (assemblyUsesSelfContainedMesh(topologyManifest)) {
+        return buildSelfContainedAssemblyMeshState(entry, topologyManifest, previewMeshData);
       }
-      return buildAssemblyMeshState(entry, topologyManifest, meshesBySourcePath);
+      return null;
     }
     const meshData = peekRenderMeshForEntry(entry);
     if (!meshData) {
@@ -213,16 +202,13 @@ export function useCadAssets({
       meshHash: entryMeshAssetHash(entry),
       meshData
     };
-  }, [buildAssemblyMeshState, buildAssemblyPreviewMeshState, entryHasMesh]);
+  }, [buildAssemblyPreviewMeshState, buildSelfContainedAssemblyMeshState, entryHasMesh]);
 
   const getCachedReferenceState = useCallback((entry) => {
     if (!entryHasReferences(entry)) {
       return null;
     }
-    const bundle = peekRenderSelectorBundle(
-      entryAssetUrl(entry, "topology"),
-      entryAssetUrl(entry, "topologyBinary")
-    );
+    const bundle = peekRenderSelectorBundle(entrySelectorTopologyAssetUrl(entry));
     return bundle ? buildNormalizedReferenceState(entry, bundle) : null;
   }, [buildNormalizedReferenceState, entryHasReferences]);
 
@@ -330,6 +316,7 @@ export function useCadAssets({
     try {
       if (entry?.kind === "assembly") {
         const meshUrl = entryAssetUrl(entry, "glb");
+        const topologyUrl = entryTopologyAssetUrl(entry);
         if (!meshUrl) {
           throw new Error(`STEP assembly is missing GLB asset: ${entry.file || "(unknown)"}`);
         }
@@ -343,35 +330,22 @@ export function useCadAssets({
           setError("");
           assemblyPreviewVisible = true;
         }
-        const topologyUrl = entryAssetUrl(entry, "topology");
         setMeshLoadStage("loading topology");
-        const topologyManifest = await loadRenderJson(topologyUrl, { signal: controller.signal });
+        const topologyManifest = await loadRenderTopologyIndex(topologyUrl, { signal: controller.signal });
         if (requestId !== requestIdRef.current) {
           return;
         }
         if (!cachedMeshState?.assemblyStructureReady) {
           setMeshState(buildAssemblyPreviewMeshState(entry, previewMeshData, topologyManifest));
         }
-        const meshRequests = assemblyCompositionMeshRequests(topologyManifest);
-        setMeshLoadStage(meshRequests.length ? "loading meshes" : "building assembly");
-        const loadedMeshes = await mapWithConcurrency(meshRequests, ASSEMBLY_MESH_LOAD_CONCURRENCY, async (request) => {
-          const meshUrl = resolveAssetUrl(request.meshUrl, topologyUrl);
-          if (!meshUrl) {
-            throw new Error(`Assembly source part is missing GLB asset: ${request.sourcePath || request.key}`);
-          }
-          return [
-            request.key,
-            await loadRenderGlb(meshUrl, { signal: controller.signal })
-          ];
-        });
-        const meshesBySourcePath = new Map(loadedMeshes);
-        if (requestId !== requestIdRef.current) {
+        if (assemblyUsesSelfContainedMesh(topologyManifest)) {
+          setMeshLoadStage("building assembly");
+          setMeshState(buildSelfContainedAssemblyMeshState(entry, topologyManifest, previewMeshData));
+          setStatus(ASSET_STATUS.READY);
+          setError("");
           return;
         }
-        setMeshState(buildAssemblyMeshState(entry, topologyManifest, meshesBySourcePath));
-        setStatus(ASSET_STATUS.READY);
-        setError("");
-        return;
+        throw new Error("STEP assembly topology is not self-contained.\nRegenerate STEP artifacts with the following command using the CAD skill:");
       }
       const meshUrl = entryMeshAssetUrl(entry);
       if (!meshUrl) {
@@ -419,7 +393,7 @@ export function useCadAssets({
         meshAbortControllerRef.current = null;
       }
     }
-  }, [buildAssemblyMeshState, buildAssemblyPreviewMeshState, cancelMeshLoad, entryHasMesh, getAssemblyMeshHash, getCachedMeshState]);
+  }, [buildAssemblyPreviewMeshState, buildSelfContainedAssemblyMeshState, cancelMeshLoad, entryHasMesh, getAssemblyMeshHash, getCachedMeshState]);
 
   const loadReferencesForEntry = useCallback(async (entry) => {
     cancelReferenceLoad();
@@ -448,8 +422,7 @@ export function useCadAssets({
 
     try {
       const bundle = await loadRenderSelectorBundle(
-        entryAssetUrl(entry, "topology"),
-        entryAssetUrl(entry, "topologyBinary"),
+        entrySelectorTopologyAssetUrl(entry),
         { signal: controller.signal }
       );
       if (requestId !== referenceRequestIdRef.current) {

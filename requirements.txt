@@ -1,5 +1,7 @@
 build123d
 ezdxf
 numpy
+pillow
+playwright
 trimesh
 vtk

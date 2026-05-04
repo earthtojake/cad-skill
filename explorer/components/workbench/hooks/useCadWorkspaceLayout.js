@@ -1,6 +1,6 @@
 import { useEffect } from "react";
 
-import { CAD_WORKSPACE_DESKTOP_MEDIA_QUERY } from "../../../lib/workbench/breakpoints.js";
+import { getCadWorkspaceLayoutMode } from "../../../lib/workbench/breakpoints.js";
 
 const SIDEBAR_WRAPPER_SELECTOR = "[data-slot='sidebar-wrapper']";
 
@@ -39,7 +39,7 @@ export function preferredPanelWidthAfterViewportSync(width, minWidth = 0) {
 
 export function useCadWorkspaceLayout({
   isDesktop,
-  setIsDesktop,
+  setLayoutMode,
   setSidebarOpen,
   setTabToolsOpen,
   setLayoutViewportWidth,
@@ -56,17 +56,16 @@ export function useCadWorkspaceLayout({
   endTabToolsResize
 }) {
   useEffect(() => {
-    const mediaQuery = window.matchMedia(CAD_WORKSPACE_DESKTOP_MEDIA_QUERY);
-    const syncViewport = (event) => {
-      setIsDesktop(event.matches);
+    const syncViewport = () => {
+      setLayoutMode(getCadWorkspaceLayoutMode(readWindowViewportWidth()));
     };
 
-    syncViewport(mediaQuery);
-    mediaQuery.addEventListener("change", syncViewport);
+    syncViewport();
+    window.addEventListener("resize", syncViewport);
     return () => {
-      mediaQuery.removeEventListener("change", syncViewport);
+      window.removeEventListener("resize", syncViewport);
     };
-  }, [setIsDesktop]);
+  }, [setLayoutMode]);
 
   useEffect(() => {
     if (!isDesktop) {

@@ -2,8 +2,12 @@ from __future__ import annotations
 
 from typing import Any
 
-from cadref.analysis import AXIS_INDEX, bbox_center, bbox_size, major_planar_face_groups
-from cadref.lookup import build_selector_index
+from common.inspect_imports import ensure_inspect_import_path
+
+ensure_inspect_import_path()
+
+from inspect_refs.analysis import AXIS_INDEX, bbox_center, bbox_size, major_planar_face_groups
+from inspect_refs.lookup import build_selector_index
 
 
 def axis_index(axis: str) -> int:

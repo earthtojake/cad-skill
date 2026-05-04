@@ -401,6 +401,14 @@ function frontMostModelIntersections(intersections) {
   return intersections.filter((intersection) => Number(intersection?.distance) <= nearestDistance + depthWindow);
 }
 
+function focusedPartIdSet(value) {
+  return new Set(
+    (Array.isArray(value) ? value : [value])
+      .map((id) => String(id || "").trim())
+      .filter(Boolean)
+  );
+}
+
 export function useExplorerPicking({
   runtimeRef,
   mountRef,
@@ -551,13 +559,13 @@ export function useExplorerPicking({
     }
 
     function visibleModelMeshes() {
-      const focusId = String(focusedPartIdRef.current || "").trim();
+      const focusIds = focusedPartIdSet(focusedPartIdRef.current);
       return runtime.displayRecords
         .filter((record) => {
           if (!record?.mesh?.visible) {
             return false;
           }
-          if (focusId && String(record?.partId || "").trim() !== focusId) {
+          if (focusIds.size && !focusIds.has(String(record?.partId || "").trim())) {
             return false;
           }
           return true;
@@ -574,13 +582,13 @@ export function useExplorerPicking({
     }
 
     function pickPartReferenceFromIntersections(intersections) {
-      const focusId = String(focusedPartIdRef.current || "").trim();
+      const focusIds = focusedPartIdSet(focusedPartIdRef.current);
       for (const intersection of intersections) {
         const partId = intersection?.object?.userData?.partId;
         if (!partId) {
           continue;
         }
-        if (focusId && partId !== focusId) {
+        if (focusIds.size && !focusIds.has(String(partId || "").trim())) {
           continue;
         }
         return partId;
@@ -640,7 +648,16 @@ export function useExplorerPicking({
     }
 
     function pickFaceReference(modelIntersections) {
-      if (!runtime.facePickMesh || !(Array.isArray(pickableFacesRef.current) ? pickableFacesRef.current : []).length) {
+      if (!(Array.isArray(pickableFacesRef.current) ? pickableFacesRef.current : []).length) {
+        return null;
+      }
+      for (const intersection of frontMostModelIntersections(modelIntersections)) {
+        const reference = faceReferenceFromIntersection(intersection);
+        if (reference) {
+          return reference;
+        }
+      }
+      if (!runtime.facePickMesh) {
         return null;
       }
       const intersections = runtime.raycaster.intersectObject(runtime.facePickMesh, false);

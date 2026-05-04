@@ -46,35 +46,19 @@ class CadSourceError(ValueError):
 
 @dataclass(frozen=True)
 class StepImportOptions:
-    export_stl: bool = False
-    stl_output: str | None = None
-    stl_tolerance: float | None = None
-    stl_angular_tolerance: float | None = None
-    export_3mf: bool = False
-    three_mf_output: str | None = None
-    three_mf_tolerance: float | None = None
-    three_mf_angular_tolerance: float | None = None
-    glb_tolerance: float | None = None
-    glb_angular_tolerance: float | None = None
-    color: tuple[float, float, float, float] | None = None
-    skip_topology: bool = False
+    stl: str | None = None
+    three_mf: str | None = None
+    mesh_tolerance: float | None = None
+    mesh_angular_tolerance: float | None = None
 
     @property
     def has_metadata(self) -> bool:
         return any(
             (
-                self.export_stl,
-                self.stl_output is not None,
-                self.stl_tolerance is not None,
-                self.stl_angular_tolerance is not None,
-                self.export_3mf,
-                self.three_mf_output is not None,
-                self.three_mf_tolerance is not None,
-                self.three_mf_angular_tolerance is not None,
-                self.glb_tolerance is not None,
-                self.glb_angular_tolerance is not None,
-                self.color is not None,
-                self.skip_topology,
+                self.stl is not None,
+                self.three_mf is not None,
+                self.mesh_tolerance is not None,
+                self.mesh_angular_tolerance is not None,
             )
         )
 
@@ -94,32 +78,9 @@ class CadSource:
     three_mf_path: Path | None = None
     dxf_path: Path | None = None
     urdf_path: Path | None = None
-    export_stl: bool = False
-    export_3mf: bool = False
-    stl_tolerance: float | None = None
-    stl_angular_tolerance: float | None = None
-    three_mf_tolerance: float | None = None
-    three_mf_angular_tolerance: float | None = None
-    glb_tolerance: float | None = None
-    glb_angular_tolerance: float | None = None
+    mesh_tolerance: float | None = None
+    mesh_angular_tolerance: float | None = None
     color: tuple[float, float, float, float] | None = None
-    skip_topology: bool = False
-
-    @property
-    def selector_manifest_path(self) -> Path | None:
-        return (
-            explorer_artifact_path_for_step_path(self.step_path, ".topology.json")
-            if self.step_path is not None and not self.skip_topology
-            else None
-        )
-
-    @property
-    def selector_binary_path(self) -> Path | None:
-        return (
-            explorer_artifact_path_for_step_path(self.step_path, ".topology.bin")
-            if self.step_path is not None and not self.skip_topology
-            else None
-        )
 
     @property
     def glb_path(self) -> Path | None:
@@ -135,16 +96,12 @@ class CadSource:
                 paths.append(self.dxf_path)
             if self.urdf_path is not None:
                 paths.append(self.urdf_path)
-        if self.export_stl and self.stl_path is not None:
+        if self.stl_path is not None:
             paths.append(self.stl_path)
-        if self.export_3mf and self.three_mf_path is not None:
+        if self.three_mf_path is not None:
             paths.append(self.three_mf_path)
         if self.glb_path is not None:
             paths.append(self.glb_path)
-        if self.selector_manifest_path is not None:
-            paths.append(self.selector_manifest_path)
-        if self.selector_binary_path is not None:
-            paths.append(self.selector_binary_path)
         return tuple(path.resolve() for path in paths)
 
 
@@ -306,12 +263,23 @@ def explorer_directory_for_step_path(step_path: Path) -> Path:
     return (base.parent / f".{base.name}").resolve()
 
 
-def explorer_artifact_path_for_step_path(step_path: Path, suffix: str) -> Path:
+def hidden_glb_path_for_step_path(step_path: Path) -> Path:
+    base = step_path.resolve()
+    return (base.parent / f".{base.name}.glb").resolve()
+
+
+def legacy_explorer_artifact_path_for_step_path(step_path: Path, suffix: str) -> Path:
     base = step_path.resolve()
     artifact_name = EXPLORER_ARTIFACT_FILENAMES.get(suffix)
     if artifact_name is None:
         raise ValueError(f"Unsupported STEP explorer artifact suffix: {suffix}")
     return (explorer_directory_for_step_path(base) / artifact_name).resolve()
+
+
+def explorer_artifact_path_for_step_path(step_path: Path, suffix: str) -> Path:
+    if suffix == ".glb":
+        return hidden_glb_path_for_step_path(step_path)
+    return legacy_explorer_artifact_path_for_step_path(step_path, suffix)
 
 
 def _iter_python_sources(root: Path) -> tuple[CadSource, ...]:
@@ -334,40 +302,8 @@ def _read_python_source(script_path: Path) -> CadSource | None:
         raise CadSourceError(
             f"{_relative_to_repo(resolved_script_path)} must define a part or assembly gen_step() entry"
         )
-    if metadata.kind == "assembly" and metadata.skip_topology:
-        raise CadSourceError(
-            f"{_relative_to_repo(resolved_script_path)} skip_topology is not supported for assembly entries"
-        )
-    if metadata.step_output is None:
-        raise CadSourceError(
-            f"{_relative_to_repo(resolved_script_path)} step_output is required"
-        )
-    step_path = _resolve_configured_artifact_path(
-        metadata.step_output,
-        base_path=resolved_script_path,
-        default_path=None,
-        expected_suffixes=(".step",),
-        field_name="step_output",
-    )
-    if metadata.stl_output is not None and not metadata.export_stl:
-        raise CadSourceError(
-            f"{_relative_to_repo(resolved_script_path)} stl_output requires export_stl = True"
-        )
-    if metadata.three_mf_output is not None and not metadata.export_3mf:
-        raise CadSourceError(
-            f"{_relative_to_repo(resolved_script_path)} 3mf_output requires export_3mf = True"
-        )
-    dxf_path = (
-        _resolve_configured_artifact_path(
-            _required_output(metadata.dxf_output, script_path=resolved_script_path, field_name="dxf_output"),
-            base_path=resolved_script_path,
-            default_path=None,
-            expected_suffixes=(".dxf",),
-            field_name="dxf_output",
-        )
-        if metadata.has_gen_dxf
-        else None
-    )
+    step_path = resolved_script_path.with_suffix(".step")
+    dxf_path = resolved_script_path.with_suffix(".dxf") if metadata.has_gen_dxf else None
     urdf_path = (
         _resolve_configured_artifact_path(
             _required_output(metadata.urdf_output, script_path=resolved_script_path, field_name="urdf_output"),
@@ -377,28 +313,6 @@ def _read_python_source(script_path: Path) -> CadSource | None:
             field_name="urdf_output",
         )
         if metadata.has_gen_urdf
-        else None
-    )
-    stl_path = (
-        _resolve_configured_artifact_path(
-            _required_output(metadata.stl_output, script_path=resolved_script_path, field_name="stl_output"),
-            base_path=resolved_script_path,
-            default_path=None,
-            expected_suffixes=(".stl",),
-            field_name="stl_output",
-        )
-        if metadata.export_stl
-        else None
-    )
-    three_mf_path = (
-        _resolve_configured_artifact_path(
-            _required_output(metadata.three_mf_output, script_path=resolved_script_path, field_name="3mf_output"),
-            base_path=resolved_script_path,
-            default_path=None,
-            expected_suffixes=(".3mf",),
-            field_name="3mf_output",
-        )
-        if metadata.export_3mf
         else None
     )
     return CadSource(
@@ -411,19 +325,12 @@ def _read_python_source(script_path: Path) -> CadSource | None:
         script_path=resolved_script_path,
         generator_metadata=metadata,
         step_path=step_path,
-        stl_path=stl_path,
-        three_mf_path=three_mf_path,
+        stl_path=None,
+        three_mf_path=None,
         dxf_path=dxf_path,
         urdf_path=urdf_path,
-        export_stl=metadata.export_stl,
-        export_3mf=metadata.export_3mf,
-        stl_tolerance=metadata.stl_tolerance,
-        stl_angular_tolerance=metadata.stl_angular_tolerance,
-        three_mf_tolerance=metadata.three_mf_tolerance,
-        three_mf_angular_tolerance=metadata.three_mf_angular_tolerance,
-        glb_tolerance=metadata.glb_tolerance,
-        glb_angular_tolerance=metadata.glb_angular_tolerance,
-        skip_topology=metadata.skip_topology,
+        mesh_tolerance=None,
+        mesh_angular_tolerance=None,
     )
 
 
@@ -447,52 +354,32 @@ def _read_step_source(
     options = options or StepImportOptions()
     if kind not in {"part", "assembly"}:
         raise CadSourceError(f"{_relative_to_repo(resolved_step_path)} kind must be 'part' or 'assembly'")
-    if kind == "assembly" and options.skip_topology:
-        raise CadSourceError(
-            f"{_relative_to_repo(resolved_step_path)} skip_topology is not supported for assembly entries"
-        )
     if resolved_step_path.suffix.lower() not in STEP_SUFFIXES:
         raise CadSourceError(f"{_relative_to_repo(resolved_step_path)} source must end in .step or .stp")
     if not resolved_step_path.is_file():
         raise CadSourceError(
             f"{_relative_to_repo(resolved_step_path)} source does not exist"
         )
-    if options.stl_output is not None and not options.export_stl:
-        raise CadSourceError(
-            f"{_relative_to_repo(resolved_step_path)} stl_output requires export_stl = true"
-        )
-    if options.export_stl and options.stl_output is None:
-        raise CadSourceError(
-            f"{_relative_to_repo(resolved_step_path)} stl_output is required when export_stl = true"
-        )
-    if options.three_mf_output is not None and not options.export_3mf:
-        raise CadSourceError(
-            f"{_relative_to_repo(resolved_step_path)} 3mf_output requires export_3mf = true"
-        )
-    if options.export_3mf and options.three_mf_output is None:
-        raise CadSourceError(
-            f"{_relative_to_repo(resolved_step_path)} 3mf_output is required when export_3mf = true"
-        )
     stl_path = (
         _resolve_configured_artifact_path(
-            options.stl_output,
+            options.stl,
             base_path=resolved_step_path,
             default_path=None,
             expected_suffixes=(".stl",),
-            field_name="stl_output",
+            field_name="stl",
         )
-        if options.export_stl
+        if options.stl is not None
         else None
     )
     three_mf_path = (
         _resolve_configured_artifact_path(
-            options.three_mf_output,
+            options.three_mf,
             base_path=resolved_step_path,
             default_path=None,
             expected_suffixes=(".3mf",),
-            field_name="3mf_output",
+            field_name="3mf",
         )
-        if options.export_3mf
+        if options.three_mf is not None
         else None
     )
 
@@ -508,40 +395,16 @@ def _read_step_source(
         step_path=resolved_step_path,
         stl_path=stl_path,
         three_mf_path=three_mf_path,
-        export_stl=options.export_stl,
-        export_3mf=options.export_3mf,
-        stl_tolerance=normalize_step_numeric(
-            options.stl_tolerance,
+        mesh_tolerance=normalize_step_numeric(
+            options.mesh_tolerance,
             base_path=resolved_step_path,
-            field_name="stl_tolerance",
+            field_name="mesh_tolerance",
         ),
-        stl_angular_tolerance=normalize_step_numeric(
-            options.stl_angular_tolerance,
+        mesh_angular_tolerance=normalize_step_numeric(
+            options.mesh_angular_tolerance,
             base_path=resolved_step_path,
-            field_name="stl_angular_tolerance",
+            field_name="mesh_angular_tolerance",
         ),
-        three_mf_tolerance=normalize_step_numeric(
-            options.three_mf_tolerance,
-            base_path=resolved_step_path,
-            field_name="3mf_tolerance",
-        ),
-        three_mf_angular_tolerance=normalize_step_numeric(
-            options.three_mf_angular_tolerance,
-            base_path=resolved_step_path,
-            field_name="3mf_angular_tolerance",
-        ),
-        glb_tolerance=normalize_step_numeric(
-            options.glb_tolerance,
-            base_path=resolved_step_path,
-            field_name="glb_tolerance",
-        ),
-        glb_angular_tolerance=normalize_step_numeric(
-            options.glb_angular_tolerance,
-            base_path=resolved_step_path,
-            field_name="glb_angular_tolerance",
-        ),
-        color=options.color,
-        skip_topology=options.skip_topology,
     )
 
 

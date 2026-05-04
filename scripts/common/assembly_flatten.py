@@ -14,7 +14,7 @@ from common.assembly_spec import (
     read_assembly_spec,
 )
 from common.catalog import cad_ref_from_step_path, find_source_by_path, source_from_path
-from common.render import part_glb_path, relative_to_repo
+from common.render import existing_part_glb_path, part_glb_path, relative_to_repo
 
 
 class AssemblyResolutionError(ValueError):
@@ -74,7 +74,7 @@ def filesystem_entry(source_path: Path) -> CatalogEntry | None:
                 source_path=source.source_path,
                 step_path=source.step_path,
                 stl_path=source.stl_path,
-                glb_path=part_glb_path(source.step_path),
+                glb_path=existing_part_glb_path(source.step_path) or part_glb_path(source.step_path),
             )
         if not resolved.is_file():
             return None
@@ -85,7 +85,7 @@ def filesystem_entry(source_path: Path) -> CatalogEntry | None:
             kind="part",
             source_path=resolved,
             step_path=resolved,
-            glb_path=part_glb_path(resolved),
+            glb_path=existing_part_glb_path(resolved) or part_glb_path(resolved),
         )
     source = source_from_path(resolved) if resolved.exists() else None
     if source is None:
@@ -113,7 +113,7 @@ def filesystem_entry(source_path: Path) -> CatalogEntry | None:
         source_path=source.source_path,
         step_path=source.step_path,
         stl_path=source.stl_path,
-        glb_path=part_glb_path(source.step_path),
+        glb_path=existing_part_glb_path(source.step_path) or part_glb_path(source.step_path),
     )
 
 

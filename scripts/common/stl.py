@@ -24,18 +24,10 @@ def export_part_stl_from_scene(step_path: Path, scene: LoadedStepScene, *, targe
     export_shape_stl(scene_export_shape(scene), target_path)
     return target_path
 
-
 def export_shape_stl(shape: object, target_path: Path) -> Path:
     target_path.parent.mkdir(parents=True, exist_ok=True)
     writer = StlAPI_Writer()
     writer.ASCIIMode = False
     if not writer.Write(shape, str(target_path)):
         raise RuntimeError(f"Failed to write STL output: {_display_path(target_path)}")
-    return target_path
-
-
-def write_empty_stl(target_path: Path) -> Path:
-    target_path.parent.mkdir(parents=True, exist_ok=True)
-    header = b"cad-harness empty STL".ljust(80, b"\0")
-    target_path.write_bytes(header + (0).to_bytes(4, byteorder="little", signed=False))
     return target_path

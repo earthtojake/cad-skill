@@ -23,6 +23,7 @@ test("look presets expose a default material color", () => {
 
 test("cinematic is the default look preset", () => {
   assert.equal(DEFAULT_LOOK_PRESET_ID, "cinematic");
+  assert.equal(LOOK_PRESETS[0]?.id, "cinematic");
   assert.equal(getLookPresetIdForSettings(DEFAULT_LOOK_SETTINGS), "cinematic");
 });
 

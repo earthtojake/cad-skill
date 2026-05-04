@@ -1,7 +1,6 @@
 import { cn } from "../../lib/cn";
 
 export const CAD_WORKSPACE_TOOLBAR_DESKTOP_WIDTH_CLASS = "w-[min(15rem,calc(100vw-2rem))]";
-export const CAD_WORKSPACE_TOOLBAR_MOBILE_WIDTH_CLASS = "w-full";
 
 export default function ToolbarShell({ className, children }) {
   return (

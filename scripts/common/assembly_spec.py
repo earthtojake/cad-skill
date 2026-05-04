@@ -8,7 +8,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from pathlib import PurePosixPath
 
-from common.catalog import find_source_by_cad_ref, find_source_by_path
+from common.catalog import find_source_by_cad_ref
 from common.metadata import parse_generator_metadata
 
 
@@ -68,14 +68,6 @@ class AssemblySpec:
     children: tuple[AssemblyNodeSpec, ...] = ()
 
 
-def cad_ref_from_assembly_path(assembly_path: Path) -> str:
-    resolved = assembly_path.resolve()
-    source = find_source_by_path(resolved)
-    if source is not None and source.kind == "assembly":
-        return source.cad_ref
-    raise AssemblySpecError(f"{resolved} is not a CAD assembly source file")
-
-
 def _display_path(path: Path) -> str:
     resolved = path.resolve()
     try:
@@ -122,8 +114,10 @@ def read_assembly_spec(assembly_path: Path) -> AssemblySpec:
 def assembly_spec_from_payload(assembly_path: Path, payload: object) -> AssemblySpec:
     resolved_path = assembly_path.resolve()
 
+    if isinstance(payload, list):
+        payload = {"children": payload}
     if not isinstance(payload, dict):
-        raise AssemblySpecError(f"{_display_path(resolved_path)} gen_step() must return an object")
+        raise AssemblySpecError(f"{_display_path(resolved_path)} gen_step() must return an assembly list or object")
 
     allowed_fields = {"instances", "children"}
     extra_fields = sorted(str(key) for key in payload if key not in allowed_fields)
@@ -214,7 +208,7 @@ def _run_assembly_generator(assembly_path: Path) -> object:
         raise AssemblySpecError(f"Failed to parse {_display_path(assembly_path)}") from exc
     if generator_metadata is None or generator_metadata.kind != "assembly":
         raise AssemblySpecError(
-            f"{_display_path(assembly_path)} must define a gen_step() assembly envelope"
+            f"{_display_path(assembly_path)} must define a gen_step() assembly return"
         )
 
     module_name = (
@@ -251,9 +245,11 @@ def _run_assembly_generator(assembly_path: Path) -> object:
         envelope = gen_step()
     except Exception as exc:
         raise AssemblySpecError(f"{_display_path(assembly_path)} gen_step() failed") from exc
+    if isinstance(envelope, list):
+        return {"children": envelope}
     if not isinstance(envelope, dict) or ("instances" not in envelope and "children" not in envelope):
         raise AssemblySpecError(
-            f"{_display_path(assembly_path)} gen_step() must return an assembly envelope with instances or children"
+            f"{_display_path(assembly_path)} gen_step() must return an assembly list or legacy envelope with instances or children"
         )
     return {key: envelope[key] for key in ("instances", "children") if key in envelope}
 
